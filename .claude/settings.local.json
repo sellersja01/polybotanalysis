@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python cheap_threshold_analysis.py)",
+      "Bash(ls wallet_*fresh*.csv wallet_*trades*.csv)",
+      "Bash(python btc_signal_analysis.py)",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
