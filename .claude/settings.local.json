@@ -4,7 +4,19 @@
       "Bash(python cheap_threshold_analysis.py)",
       "Bash(ls wallet_*fresh*.csv wallet_*trades*.csv)",
       "Bash(python btc_signal_analysis.py)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(ssh -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" opc@132.145.168.14 \"echo connected\")",
+      "Bash(ssh -o:*)",
+      "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/wallet_*.zip\" \"/c/Users/selle/git_repository/polybotanalysis/\")",
+      "Bash(for f:*)",
+      "Bash(do unzip:*)",
+      "Bash(done)",
+      "Bash(python analyze_wallet_timing.py)",
+      "Bash(python analyze_candle_patterns.py)",
+      "Bash(python analyze_entry_times.py)",
+      "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/market_*.db.gz\" \"/c/Users/selle/git_repository/polybotanalysis/databases/\")",
+      "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/market_btc_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_eth_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_sol_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_sol_15m.db.gz\" \"/c/Users/selle/git_repository/polybotanalysis/databases/\")",
+      "Bash(python delayed_exit_backtest.py)"
     ]
   }
 }
