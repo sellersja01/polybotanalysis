@@ -16,7 +16,20 @@
       "Bash(python analyze_entry_times.py)",
       "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/market_*.db.gz\" \"/c/Users/selle/git_repository/polybotanalysis/databases/\")",
       "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/market_btc_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_eth_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_sol_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_sol_15m.db.gz\" \"/c/Users/selle/git_repository/polybotanalysis/databases/\")",
-      "Bash(python delayed_exit_backtest.py)"
+      "Bash(python delayed_exit_backtest.py)",
+      "Read(//c/Users/selle/.claude/projects/c--Users-selle-git-repository-polybotanalysis/**)",
+      "Read(//c/Users/selle/.claude/**)",
+      "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/wallet_7_fresh.csv\" \"/c/Users/selle/git_repository/polybotanalysis/Wallets_new/wallet_7_fresh.csv\")",
+      "Bash(python asymmetric_backtest.py)",
+      "Bash(scp -o StrictHostKeyChecking=no -i \"C:\\\\Users\\\\selle\\\\oracle.key\" \"opc@132.145.168.14:/home/opc/market_btc_5m.db.gz\" \"opc@132.145.168.14:/home/opc/market_btc_15m.db.gz\" \"opc@132.145.168.14:/home/opc/market_eth_5m.db.gz\" \"/c/Users/selle/git_repository/polybotanalysis/databases/\")",
+      "Bash(python3 -c \":*)",
+      "Bash(python3 wallet7_pnl.py)",
+      "Bash(ssh -i \"C:\\\\Users\\\\selle\\\\oracle.key\" -o StrictHostKeyChecking=no -o ConnectTimeout=10 opc@132.145.168.14 \"cat collector_v2.py\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\selle\\\\oracle.key\" -o StrictHostKeyChecking=no opc@132.145.168.14 \"ps aux | grep collector_v2 | grep -v grep\")",
+      "Bash(scp -i \"C:\\\\Users\\\\selle\\\\oracle.key\" -o StrictHostKeyChecking=no \"C:\\\\Users\\\\selle\\\\git_repository\\\\polybotanalysis\\\\collector_v2_new.py\" opc@132.145.168.14:/home/opc/collector_v2.py)",
+      "Bash(ssh -i \"C:\\\\Users\\\\selle\\\\oracle.key\" -o StrictHostKeyChecking=no opc@132.145.168.14 \"sleep 4 && tail -20 /home/opc/collector.log\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\selle\\\\oracle.key\" -o StrictHostKeyChecking=no opc@132.145.168.14 \"ps aux | grep -E ''run_collector|collector_v2'' | grep -v grep\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\selle\\\\oracle.key\" -o StrictHostKeyChecking=no opc@132.145.168.14 \"kill 12285 12286 12535 12536 12578 12579 2>/dev/null; sleep 2; nohup /home/opc/run_collector.sh > /home/opc/collector.log 2>&1 & echo \"\"wrapper PID: $!\"\")"
     ]
   }
 }
