@@ -20,15 +20,16 @@ from datetime import datetime, timezone
 
 # ── Wallets ───────────────────────────────────────────────────────────────────
 WALLETS = {
-    'wallet_1': '0x61276aba49117fd9299707d5d573652949d5c977',
-    'wallet_2': '0x5bde889dc26b097b5eaa2f1f027e01712ebccbb7',
-    'wallet_3': '0xd111ced402bac802f74606deca83bbf6a1eaaf32',
-    'wallet_4': '0x437bfe05a1e169b1443f16e718525a88b6f283b2',
-    'wallet_5': '0x52f8784a81d967a3afb74d2e1608503ff5e261b9',
-    'wallet_6': '0xa84edaf1a562eabb463dc6cf4c3e9c407a5edbeb',
-    'wallet_7': '0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82',
-    'wallet_8': '0xf539c942036cc7633a1e0015209a1343e9b2dda9',
-    'wallet_9': '0x37c94ea1b44e01b18a1ce3ab6f8002bd6b9d7e6d',
+    'wallet_1':       '0x61276aba49117fd9299707d5d573652949d5c977',
+    'wallet_2':       '0x5bde889dc26b097b5eaa2f1f027e01712ebccbb7',
+    'wallet_3':       '0xd111ced402bac802f74606deca83bbf6a1eaaf32',
+    'wallet_4':       '0x437bfe05a1e169b1443f16e718525a88b6f283b2',
+    'wallet_5':       '0x52f8784a81d967a3afb74d2e1608503ff5e261b9',
+    'wallet_6':       '0xa84edaf1a562eabb463dc6cf4c3e9c407a5edbeb',
+    'wallet_7':       '0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82',
+    'wallet_8':       '0xf539c942036cc7633a1e0015209a1343e9b2dda9',
+    'wallet_9':       '0x37c94ea1b44e01b18a1ce3ab6f8002bd6b9d7e6d',
+    'boshbashbish':   '0x29bc82f761749e67fa00d62896bc6855097b683c',
 }
 
 POLL_INTERVAL = 60    # seconds between polls per wallet
