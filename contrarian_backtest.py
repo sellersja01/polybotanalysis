@@ -64,14 +64,9 @@ def run_backtest(db_path, label, threshold, max_buys, cooldown, stop_loss=None):
         if not up_ticks or not dn_ticks:
             continue
 
-        # Determine resolution
+        # Determine resolution — use ALL candles, winner = highest mid at last tick
         final_up = up_ticks[-1]['mid']
-        if final_up >= 0.85:
-            resolved = 'Up'
-        elif final_up <= 0.15:
-            resolved = 'Down'
-        else:
-            continue
+        resolved = 'Up' if final_up >= 0.5 else 'Down'
 
         # Simulate: scan ticks in time order, buy when side drops below threshold
         up_fills = []   # list of ask prices paid
