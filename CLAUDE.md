@@ -1,8 +1,8 @@
 # Polymarket Trading Bot — Project Context
 
 ## What This Project Is
-Automated analysis and paper trading system for Polymarket Up/Down binary markets.
-Every 5 or 15 minutes, Polymarket opens a BTC/ETH market: Up token pays $1 if price went up, Down pays $0 (and vice versa). We collect live odds, backtest strategies, and paper trade them.
+Automated analysis and trading system for Polymarket Up/Down binary markets.
+Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays $1 if price went up, Down pays $0 (and vice versa). We collect live odds, backtest strategies, and are now building a **cross-platform arbitrage bot** between Polymarket and Kalshi.
 
 ## Infrastructure
 - **VPS**: Oracle Cloud Always Free — `132.145.168.14` (opc user)
@@ -11,210 +11,176 @@ Every 5 or 15 minutes, Polymarket opens a BTC/ETH market: Up token pays $1 if pr
 - **SSH command (PC)**: `ssh -i "C:\Users\James\btc-oracle-key\oracle-btc-collector.key" opc@132.145.168.14`
 - **SSH command (Laptop)**: `ssh -i "C:\Users\selle\oracle.key" opc@132.145.168.14`
 - **NOTE**: User will specify PC or Laptop at the start of each session — use the correct key
-- **Storage**: 30GB boot volume (11GB used), expandable to 200GB free
+- **Storage**: 30GB boot volume (~11GB used), expandable to 200GB free
+- **Oracle SSH rate limiter**: Blocks after ~4 rapid connections — if SSH fails, wait 10-30 min or have user SSH manually
+
+## Kalshi API Credentials
+- **Key ID**: `d307ccc8-df96-4210-8d42-8d70c75fe71f`
+- **Key file (local)**: `C:\Users\James\kalshi_key.pem.txt`
+- **Key file (VPS)**: `/home/opc/kalshi_key.pem`
+- **Signing**: RSA-PSS with SHA-256 (NOT PKCS1v15)
+- Kalshi crypto 15m Up/Down markets are **legal in the US** (CFTC-regulated)
 
 ## Processes Running on VPS (all nohup)
 | Process | Log | Purpose |
 |---------|-----|---------|
-| `collector_v2.py` | `collector.log` | Collects live BTC/ETH odds every few seconds (via auto-restart wrapper) |
-| `paper_trader_v8.py` | `v8_single.log` | Paper trader — single entry at mid=0.25 |
-| `paper_trader_v8_layered.py` | `v8_layered.log` | Paper trader — all 5 levels (0.45→0.25) |
-| `paper_trader_contrarian.py` | `contrarian.log` | Paper trader — contrarian cheap-side DCA (launched 2026-03-24) |
-| `wallet_collector.py` | `wallet_collector.log` | Polls 9 wallets every 60s for new trades |
+| `arb_collector.py` | `arb_collector.log` | **PRIMARY** — collects Polymarket + Kalshi prices simultaneously for BTC/ETH/SOL/XRP 15m |
 
-**Collector runs via auto-restart wrapper** (`run_collector.sh`):
-```bash
-# Already running — survives crashes automatically
-# To start manually:
-nohup bash /home/opc/run_collector.sh > collector.log 2>&1 &
-```
+**All old processes (collector_v2, paper traders, wallet_collector) were killed on 2026-03-26 to clear the VPS for the arb collector.**
 
-**Restart paper traders after VPS reboot:**
+**Restart arb collector after reboot:**
 ```bash
-nohup python3 -u paper_trader_v8.py > v8_single.log 2>&1 &
-nohup python3 -u paper_trader_v8_layered.py > v8_layered.log 2>&1 &
-nohup python3 -u paper_trader_contrarian.py > contrarian.log 2>&1 &
-nohup python3 -u wallet_collector.py > wallet_collector.log 2>&1 &
+nohup python3 -u /home/opc/arb_collector.py > /home/opc/arb_collector.log 2>&1 &
 ```
 
 ## Databases on VPS (`/home/opc/`)
 | DB | Contents |
 |----|----------|
-| `market_btc_5m.db` | Live BTC 5m odds (primary analysis DB) |
-| `market_btc_15m.db` | Live BTC 15m odds |
-| `market_eth_5m.db` | Live ETH 5m odds |
-| `market_eth_15m.db` | Live ETH 15m odds (avoid — negative ROI) |
-| `paper_v8_single.db` | Paper trader results (single entry) |
-| `paper_v8_layered.db` | Paper trader results (layered) |
-| `paper_contrarian.db` | Paper trader results (contrarian DCA) |
-| `wallet_trades.db` | All 9 wallet trade history |
+| `arb_collector.db` | **PRIMARY** — live side-by-side Polymarket + Kalshi prices for BTC/ETH/SOL/XRP 15m |
+| `paper_v8_single.db` | Paper trader results (single entry) — no longer running |
+| `paper_v8_layered.db` | Paper trader results (layered) — no longer running |
+| `paper_contrarian.db` | Paper trader results (contrarian DCA) — no longer running |
+| `wallet_trades.db` | All 9 wallet trade history — collector no longer running |
 
-**Local copies** (3-day snapshot used for backtesting):
-`C:\Users\selle\git_repository\polybotanalysis\databases\market_btc_5m.db` etc.
-
-## The Strategies (Backtested & Paper Trading)
-
-### Strategy 1: Wait-for-Divergence (V8)
-- Monitor BTC_5m, BTC_15m, ETH_5m (NOT ETH_15m)
-- When either side's mid drops to threshold, buy BOTH sides at current ask
-- If loser's mid drops to 0.20, early exit at bid = 2×mid − ask
-- Hold winner to $1.00 resolution
-- **Winner = whichever side has higher mid at last observed tick (100% of candles)**
-
-#### V8 Backtest Results (100% candles, real fees, 3-day sample)
-| Config | Market | n | WR% | ROI% | $/candle |
-|--------|--------|---|-----|------|----------|
-| Single 0.25 | BTC_5m | 742 | 80.5% | 3.60% | +$3.59 |
-| Single 0.25 | BTC_15m | 248 | 79.8% | 1.63% | +$1.62 |
-| Single 0.25 | ETH_5m | 702 | 80.3% | 1.56% | +$1.57 |
-| Single 0.25 | ETH_15m | 248 | 74.6% | -2.15% | -$2.15 ❌ |
-| All 5 levels | BTC_5m | 790 | 76.6% | 2.89% | +$13.07 |
-| All 5 levels | BTC_15m | 258 | 77.1% | 0.39% | +$1.80 |
-| All 5 levels | ETH_5m | 735 | 77.1% | 0.20% | +$0.93 |
-| All 5 levels | ETH_15m | 256 | 71.1% | -3.13% | -$14.63 ❌ |
-
-#### V8 Live Paper Trading Results (as of 2026-03-24, ~2 days)
-| Config | n | WR% | ROI% | Note |
-|--------|---|-----|------|------|
-| V8 Single | 688 | 80.2% | -0.11% | Near-zero, likely weekend effect |
-| V8 Layered | 701 | 78.9% | -0.57% | Near-zero, likely weekend effect |
-WR matches backtest perfectly. ROI near-zero likely due to weekend low-volatility trading — need weekday data to confirm edge.
+**Note**: The 5m/15m market DBs (market_btc_5m.db etc.) were wiped on 2026-03-26 to free space.
 
 ---
 
-### Strategy 2: Contrarian Cheap-Side DCA (NEW — paper trading since 2026-03-24)
+## Current Focus: Cross-Platform Arbitrage (Strategy 3)
 
-**Why we're running it:** Reverse-engineered from wallet_7 (a profitable on-chain trader with 67% WR, +$42k on $2M deployed). Analysis showed wallet_7 mechanically DCA-buys whichever side is falling cheapest, using the early hedge exit as the key edge. Backtested across 3,340 candles (BTC_5m + BTC_15m + ETH_5m) showing ~23% ROI — significantly stronger than V8. Triggers on 96%+ of all candles.
+### The Core Idea
+Polymarket and Kalshi both run BTC/ETH/SOL/XRP 15-minute Up/Down binary markets simultaneously. When their prices diverge, you can buy the cheap side on one platform and the cheap side on the other — if `poly_up_ask + kalshi_dn_ask < 1.00`, you lock in a guaranteed profit at settlement regardless of outcome.
 
-**How it works:**
-1. Watch both sides of each candle
-2. Whichever side first drops to mid=0.40 becomes the **cheap side**
-3. DCA-buy the cheap side at each level as it keeps falling: `0.40 → 0.35 → 0.30 → 0.25 → 0.20 → 0.15 → 0.10`
-4. When cheap side hits mid=0.25, also buy the **expensive side once** (hedge, 100 shares)
-5. If the hedge side later drops to mid=0.20 (meaning cheap side has risen to ~0.80 and is winning), **early exit the hedge** at bid = 2×mid − ask to recoup capital
-6. Hold the cheap side to $1.00 resolution
+**Confirmed live**: We observed gaps of 5-6¢ between platforms in early live data (e.g. ETH: Poly up=0.64 vs Kalshi up=0.59).
 
-**Key insight:** The cheap side gets temporarily depressed by momentum traders, but mean-reverts to win ~36% of the time. The hedge on the expensive side is pure insurance — if cheap side wins, the hedge is exited early for partial recovery; if cheap side loses, the hedge pays $1.00.
+### Fee Structure
+**Polymarket taker fee:**
+```python
+fee = shares * price * 0.25 * (price * (1 - price)) ** 2
+```
+Peaks at ~1.56% at p=0.50. Maker rebate = 20%.
 
-**Config (paper trader):**
-- `CHEAP_SHARES = 100` per level (7 levels = up to 700 shares per candle)
-- `HEDGE_SHARES = 100` once at mid=0.25
-- `EXIT_MID = 0.20` for hedge early exit
+**Kalshi taker fee:**
+```python
+fee = 0.07 * p * (1 - p)
+```
+Peaks at ~1.75% at p=0.50. **Kalshi maker fee = 0% (limit orders).**
 
-#### Contrarian Backtest Results (100% candles, real fees, 3,340 candles)
-| Config | n | WR% | ROI% | $/candle | avg cost/candle |
-|--------|---|-----|------|----------|-----------------|
-| Cheap only 100sh + exit | 3340 | 36.1% | 23.6% | +$32 | $137 |
-| 3:1 (300sh cheap / 100sh hedge) | 3340 | 38.3% | 21.6% | +$105 | $486 |
-| 5:1 (500sh cheap / 100sh hedge) | 3340 | 37.8% | 22.4% | +$170 | $760 |
-| 10:1 (1000sh cheap / 100sh hedge) | 3340 | 36.9% | 23.1% | +$334 | $1,447 |
+**Break-even**: Combined fees ~1.6-3.3% depending on price. Need at least that much gap to profit.
+- A 6¢ gap at p=0.50 → ~3¢ net after fees ✓ profitable
 
-**At $1,000 deployed per candle: ~$215–236/candle across all configs.**
+### Kalshi Market Tickers (15m series)
+| Asset | Series | Example ticker |
+|-------|--------|----------------|
+| BTC | `KXBTC15M` | `KXBTC15M-26MAR260745-45` |
+| ETH | `KXETH15M` | `KXETH15M-26MAR260745-45` |
+| SOL | `KXSOL15M` | `KXSOL15M-26MAR260745-45` |
+| XRP | `KXXRP15M` | `KXXRP15M-26MAR260745-45` |
 
-**File:** `paper_trader/paper_trader_contrarian.py` → deployed at `/home/opc/paper_trader_contrarian.py`
+Kalshi ticker format: `{SERIES}-{DDMMMYY}{HHMM}-{MM}` where the last two digits are the minute offset.
 
-### Fee Formula (Polymarket Crypto markets)
+### Polymarket WebSocket
+- URL: `wss://ws-subscriptions-clob.polymarket.com/ws/market` (public, no auth)
+- Market slug format: `{asset}-updown-15m-{unix_ts_aligned_to_900}`
+- Subscribe with `{"type": "subscribe", "channel": "live_activity", "assets_ids": [up_token, dn_token]}`
+- Prices come as `book` events with `bids`/`asks` arrays
+
+### Kalshi WebSocket
+- URL: `wss://api.elections.kalshi.com/trade-api/ws/v2`
+- Requires RSA-PSS signed headers: `KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP`, `KALSHI-ACCESS-SIGNATURE`
+- Sign: `f"{timestamp_ms}GET/trade-api/ws/v2"` with RSA-PSS SHA-256
+- Use `additional_headers=` (NOT `extra_headers=`) for websockets library on VPS
+- Subscribe: `{"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_ticker": ticker}}`
+- Messages: `{"type": "ticker", "msg": {"yes_bid_dollars": "0.59", "yes_ask_dollars": "0.60", ...}}`
+- **Note**: WS ticker messages only include `yes_bid/ask`. Derive no prices: `no_bid = 1 - yes_ask`, `no_ask = 1 - yes_bid`
+
+### arb_collector.py — The Data Collector
+**File**: `c:\Users\James\polybotanalysis\arb_collector.py` → deployed at `/home/opc/arb_collector.py`
+
+**What it does**:
+- Connects to both Polymarket WS and Kalshi WS simultaneously
+- Every price update from either platform writes a full snapshot row with BOTH platforms' prices
+- Auto-reconnects on candle rollover every 15 minutes
+- Waits for Kalshi to publish new candle market before subscribing (prevents stale-price bug)
+- Records candle outcomes when yes_bid >= 0.99 or no_bid >= 0.99
+- Prints status every 60s with current prices and gaps
+
+**DB Schema** (`/home/opc/arb_collector.db`):
+```sql
+snapshots: ts, asset, candle_id, trigger, p_up_bid, p_up_ask, p_dn_bid, p_dn_ask,
+           k_up_bid, k_up_ask, k_dn_bid, k_dn_ask
+outcomes:  candle_id, asset, outcome (Up/Down), ts
+```
+
+**Status as of 2026-03-26**:
+- Running since ~05:00 UTC, collecting all 4 assets
+- ~255k total rows, ~77k active-range rows (both platforms in 0.05-0.95 range)
+- Confirmed gaps of 5-6¢ observed in early data
+
+**Known bugs fixed**:
+- `extra_headers` → `additional_headers` (websockets version on VPS)
+- Kalshi WS ticker only has `yes_bid/ask` — derive `no` prices mathematically
+- After candle rollover, Kalshi API returns old resolved ticker — fixed by polling until `open_time >= candle_end`
+- RSA-PSS (not PKCS1v15) required for Kalshi auth
+
+### Arb Bot Files
+| File | Purpose |
+|------|---------|
+| `arb_collector.py` | Live data collector — Poly + Kalshi side-by-side |
+| `arb_bot/kalshi_client.py` | Kalshi REST + WS client with RSA-PSS auth |
+| `arb_bot/polymarket_client.py` | Polymarket REST + WS client |
+| `arb_bot/arb_detector.py` | `check_arb()` function, `ArbState` class |
+| `arb_bot/main.py` | Full async arb bot (DRY_RUN mode) |
+| `arb_bot/live_prices.py` | Snapshot price checker — both platforms |
+
+---
+
+## Previous Strategies (Archived — VPS processes killed 2026-03-26)
+
+### Strategy 1: Wait-for-Divergence (V8)
+- Buy BOTH sides when either mid drops to 0.25
+- Hold winner to $1.00, early-exit loser at mid=0.20
+- **Results**: BTC_5m 80.5% WR, 3.6% ROI (backtest). Live paper trading near-zero ROI (suspected weekend effect, never re-confirmed on weekdays)
+- **Status**: Killed — pivoting to arb strategy
+
+### Strategy 2: Contrarian Cheap-Side DCA
+- DCA-buy the falling side at 0.40→0.35→0.30→0.25→0.20→0.15→0.10
+- Hedge by buying expensive side once at mid=0.25; early-exit hedge at mid=0.20
+- **Results**: 36% WR, ~23% ROI on 3,340 candle backtest
+- **Status**: Killed — pivoting to arb strategy
+
+### Fee Formula (Polymarket)
 ```python
 fee = shares * price * 0.25 * (price * (1 - price)) ** 2
 ```
 Peaks at 1.56% at p=0.50. Maker rebate = 20%.
 
-### Key Decisions Made
-- **ETH_15m excluded** — consistently negative ROI across all configs
-- **Winner determination**: use highest mid at last tick (not 0.85/0.15 threshold) — includes 100% of candles
-- **Exit price**: bid = 2×mid − ask (realistic taker sell)
-- **Early exit at mid=0.20** is the optimal threshold
+---
 
-## Polymarket Market Structure
-- Up/Down tokens always sum to ~1.00
-- When one side hits mid=0.25, the other is at ~0.75
-- Strategy triggers on EITHER side dropping — catches moves in both directions
-- Flat candles (both sides stay near 0.50) → no entry, no loss
-- ~84% of BTC_5m candles trigger at mid=0.25 threshold
+## Wallet_7 Analysis (Concluded 2026-03-25)
 
-## The 9 Tracked Wallets
-```python
-WALLETS = {
-    'wallet_1': '0x61276aba49117fd9299707d5d573652949d5c977',
-    'wallet_2': '0x5bde889dc26b097b5eaa2f1f027e01712ebccbb7',
-    'wallet_3': '0xd111ced402bac802f74606deca83bbf6a1eaaf32',
-    'wallet_4': '0x437bfe05a1e169b1443f16e718525a88b6f283b2',
-    'wallet_5': '0x52f8784a81d967a3afb74d2e1608503ff5e261b9',
-    'wallet_6': '0xa84edaf1a562eabb463dc6cf4c3e9c407a5edbeb',
-    'wallet_7': '0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82',
-    'wallet_8': '0xf539c942036cc7633a1e0015209a1343e9b2dda9',
-    'wallet_9': '0x37c94ea1b44e01b18a1ce3ab6f8002bd6b9d7e6d',
-}
-```
-Wallet trades stored in `/home/opc/wallet_trades.db` — ~3,300-3,500 trades per wallet backfilled, then continuous 60s polling.
+- **67.0% WR | +$42,154 net | 2.04% ROI** on 315 candles
+- **Conclusion**: Edge is NOT from directional prediction (share ratio only 1.04× — barely tilted)
+- **Hypothesis**: Exploiting cross-platform mispricings between Polymarket and Binance/Kalshi — same idea as our arb bot
+- IPWDCA strategy (two-sided symmetric DCA) tested and failed: -18% to -29% ROI
 
-## Key Files
-| File | Purpose |
-|------|---------|
-| `paper_trader/paper_trader_v8.py` | Paper trader — single 0.25 entry (V8) |
-| `paper_trader/paper_trader_v8_layered.py` | Paper trader — all 5 levels (V8) |
-| `paper_trader/paper_trader_contrarian.py` | Paper trader — contrarian cheap-side DCA |
-| `layered_entry_backtest.py` | Main backtest (100% candles, real fees) |
-| `early_exit_backtest.py` | Early exit strategy backtest |
-| `wallet_collector.py` | Continuous wallet trade collector |
-| `wallet7_strategy_analysis.py` | Statistical analysis of wallet_7 strategy |
-| `wallet7_deep_analysis.py` | Deep SQL analysis of wallet_7 (runs on VPS) |
-| `wallet7_loss_analysis.py` | Win/loss pattern analysis — cross-references wallet_trades.db + market_btc_5m.db + Polymarket API |
-| `ipwdca_backtest.py` | IPWDCA strategy backtest (inverse-price-weighted DCA — tested, found unprofitable) |
-| `show_pnl.py` | View paper trader PnL |
+---
 
-## Backtesting Rules (ALWAYS follow these)
+## Backtesting Rules (for any future backtests)
 - **100% of candles** — never filter to decisive only
 - **Winner = highest mid at last observed tick** (not >= 0.85 threshold)
-- **Real Polymarket fees** applied on every entry
+- **Real fees** applied on every entry
 - **Bid = 2×mid − ask** for exit prices (not mid)
 - Entry at **ask price** (not mid)
 
-## Wallet_7 Deep Analysis (2026-03-25)
+---
 
-### PnL Summary (from Polymarket API resolution)
-- 315 candles analyzed (historical API backfill)
-- **67.0% WR | +$42,154 net | 2.04% ROI | $133/candle avg**
-- Deploys ~$6,500/candle on average
-
-### Live Collection Stats (3 days: 2026-03-22 to 2026-03-25)
-- **478,790 BUY trades** across 659 candles — 726 trades/candle avg
-- **Avg trade size: $9.49** — tiny, highly mechanical bot
-- **$6,893/candle avg spend** (~50× our contrarian backtest scale)
-- Almost exclusively BTC (99.3%): 475k BTC trades vs 3.3k ETH
-- Up avg price: **0.467** | Down avg price: **0.458** — both below 0.50
-- Up shares ≈ Down shares (~4.91M each) — roughly equal share counts both sides
-- Combined avg cost per pair: **0.925** → $0.075 gross edge per share pair
-- **Heavily weekday-weighted**: Sun $95k vs Mon $1.8M (Sunday ~5% of weekday volume)
-- Hourly peak: 00:00–02:00 UTC; quietest: 08:00 and 19:00 UTC
-
-### Strategy Hypothesis (revised 2026-03-25)
-Wallet_7 is NOT a pure market maker. Key evidence: **67% WR is genuinely directional** — a symmetric market maker would be ~50%. Revised hypothesis:
-
-1. **External BTC price signal** — they likely have a live price feed or momentum model that tells them which direction the 5-minute candle is likely to resolve
-2. **Both-sided continuous DCA** — they buy BOTH Up and Down throughout each candle in tiny $9.49 increments, but **tilt toward whichever side their signal favors**
-3. **Flat 0.0–1.0 distribution is an aggregate artifact** — within any single candle they're overweighting one side; flat distribution emerges because they favor Up and Down equally across many candles
-4. **726 trades/candle** is execution style — breaking large positions into tiny orders to minimize slippage and average into a better blended price
-
-### IPWDCA Strategy Test (2026-03-25) — FAILED
-Tested "Inverse-Price-Weighted Continuous DCA" — buy both sides proportional to (1 - price):
-- Result: **-18% to -29% ROI** across all divergence thresholds (0.0 to 0.30)
-- Even in pure maker mode (buy at mid, 20% rebate): **-15.6% ROI**
-- Root cause: spread drag at extreme prices (3.3% at p=0.30 vs 2.0% at p=0.50) exceeds mathematical edge
-- **Conclusion: two-sided symmetric DCA doesn't work as a taker. Wallet_7's edge is their directional signal, not the execution method.**
-
-### Open Investigation: Loss Pattern Analysis (2026-03-25)
-Running `wallet7_loss_analysis.py` on VPS to identify patterns in wallet_7's 104 losing candles:
-- For each candle: net position (Up-heavy vs Down-heavy) cross-referenced with resolution
-- Odds trajectory from `market_btc_5m.db` pulled for wins vs losses
-- Goal: reverse-engineer what signal wallet_7 uses — what happens during losing candles that their signal missed?
-- **Results pending** — script running at `/home/opc/loss_analysis.log`
-
-## Next Steps / Open Questions
-- **Read loss analysis results** once `wallet7_loss_analysis.py` completes on VPS
-- **Contrarian paper trader** (launched 2026-03-24) — need 1-2 weeks of data to validate ~23% backtest ROI
-- **V8 paper traders** — 2 days of data showing near-zero ROI; likely weekend effect, check again after weekdays
-- **Switch VPS process management to systemd** — replace nohup+wrapper with proper unit files for all 5 processes
-- Consider going live with contrarian strategy once paper trading confirms edge
-- Wallet collector running — analyze other wallets once more data accumulates
-- VPS storage: expand boot volume to 200GB when approaching 25GB used
+## Next Steps
+1. **Analyze arb_collector.db** — download after 24h+ of data, measure:
+   - How often do gaps > 3¢ appear? (min profitable threshold after fees)
+   - How large are typical gaps?
+   - How long do gaps last? (determines if manual or bot execution is needed)
+   - Which assets have the most/biggest gaps?
+   - Do gaps correlate with time of day or market volatility?
+2. **Build the live arb executor** once gap analysis confirms edge
+3. **VPS storage**: expand boot volume to 200GB when approaching 25GB used
