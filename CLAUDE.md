@@ -158,6 +158,9 @@ Wallet trades stored in `/home/opc/wallet_trades.db` — ~3,300-3,500 trades per
 | `early_exit_backtest.py` | Early exit strategy backtest |
 | `wallet_collector.py` | Continuous wallet trade collector |
 | `wallet7_strategy_analysis.py` | Statistical analysis of wallet_7 strategy |
+| `wallet7_deep_analysis.py` | Deep SQL analysis of wallet_7 (runs on VPS) |
+| `wallet7_loss_analysis.py` | Win/loss pattern analysis — cross-references wallet_trades.db + market_btc_5m.db + Polymarket API |
+| `ipwdca_backtest.py` | IPWDCA strategy backtest (inverse-price-weighted DCA — tested, found unprofitable) |
 | `show_pnl.py` | View paper trader PnL |
 
 ## Backtesting Rules (ALWAYS follow these)
@@ -167,16 +170,51 @@ Wallet trades stored in `/home/opc/wallet_trades.db` — ~3,300-3,500 trades per
 - **Bid = 2×mid − ask** for exit prices (not mid)
 - Entry at **ask price** (not mid)
 
-## Wallet_7 Analysis (2026-03-24)
-- 315 candles analyzed, all resolved via Polymarket API
+## Wallet_7 Deep Analysis (2026-03-25)
+
+### PnL Summary (from Polymarket API resolution)
+- 315 candles analyzed (historical API backfill)
 - **67.0% WR | +$42,154 net | 2.04% ROI | $133/candle avg**
 - Deploys ~$6,500/candle on average
-- Strategy identified as contrarian cheap-side DCA (mechanically buys cheapest side)
-- Lower ROI than our backtest (~2% vs ~23%) likely because they don't aggressively early-exit the losing side
+
+### Live Collection Stats (3 days: 2026-03-22 to 2026-03-25)
+- **478,790 BUY trades** across 659 candles — 726 trades/candle avg
+- **Avg trade size: $9.49** — tiny, highly mechanical bot
+- **$6,893/candle avg spend** (~50× our contrarian backtest scale)
+- Almost exclusively BTC (99.3%): 475k BTC trades vs 3.3k ETH
+- Up avg price: **0.467** | Down avg price: **0.458** — both below 0.50
+- Up shares ≈ Down shares (~4.91M each) — roughly equal share counts both sides
+- Combined avg cost per pair: **0.925** → $0.075 gross edge per share pair
+- **Heavily weekday-weighted**: Sun $95k vs Mon $1.8M (Sunday ~5% of weekday volume)
+- Hourly peak: 00:00–02:00 UTC; quietest: 08:00 and 19:00 UTC
+
+### Strategy Hypothesis (revised 2026-03-25)
+Wallet_7 is NOT a pure market maker. Key evidence: **67% WR is genuinely directional** — a symmetric market maker would be ~50%. Revised hypothesis:
+
+1. **External BTC price signal** — they likely have a live price feed or momentum model that tells them which direction the 5-minute candle is likely to resolve
+2. **Both-sided continuous DCA** — they buy BOTH Up and Down throughout each candle in tiny $9.49 increments, but **tilt toward whichever side their signal favors**
+3. **Flat 0.0–1.0 distribution is an aggregate artifact** — within any single candle they're overweighting one side; flat distribution emerges because they favor Up and Down equally across many candles
+4. **726 trades/candle** is execution style — breaking large positions into tiny orders to minimize slippage and average into a better blended price
+
+### IPWDCA Strategy Test (2026-03-25) — FAILED
+Tested "Inverse-Price-Weighted Continuous DCA" — buy both sides proportional to (1 - price):
+- Result: **-18% to -29% ROI** across all divergence thresholds (0.0 to 0.30)
+- Even in pure maker mode (buy at mid, 20% rebate): **-15.6% ROI**
+- Root cause: spread drag at extreme prices (3.3% at p=0.30 vs 2.0% at p=0.50) exceeds mathematical edge
+- **Conclusion: two-sided symmetric DCA doesn't work as a taker. Wallet_7's edge is their directional signal, not the execution method.**
+
+### Open Investigation: Loss Pattern Analysis (2026-03-25)
+Running `wallet7_loss_analysis.py` on VPS to identify patterns in wallet_7's 104 losing candles:
+- For each candle: net position (Up-heavy vs Down-heavy) cross-referenced with resolution
+- Odds trajectory from `market_btc_5m.db` pulled for wins vs losses
+- Goal: reverse-engineer what signal wallet_7 uses — what happens during losing candles that their signal missed?
+- **Results pending** — script running at `/home/opc/loss_analysis.log`
 
 ## Next Steps / Open Questions
+- **Read loss analysis results** once `wallet7_loss_analysis.py` completes on VPS
 - **Contrarian paper trader** (launched 2026-03-24) — need 1-2 weeks of data to validate ~23% backtest ROI
 - **V8 paper traders** — 2 days of data showing near-zero ROI; likely weekend effect, check again after weekdays
+- **Switch VPS process management to systemd** — replace nohup+wrapper with proper unit files for all 5 processes
 - Consider going live with contrarian strategy once paper trading confirms edge
 - Wallet collector running — analyze other wallets once more data accumulates
 - VPS storage: expand boot volume to 200GB when approaching 25GB used
