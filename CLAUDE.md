@@ -114,8 +114,42 @@ outcomes:  candle_id, asset, outcome (Up/Down), ts
 
 **Status as of 2026-03-26**:
 - Running since ~05:00 UTC, collecting all 4 assets
-- ~255k total rows, ~77k active-range rows (both platforms in 0.05-0.95 range)
+- ~305k total rows, ~114k active-range rows (both platforms in 0.05-0.95 range)
 - Confirmed gaps of 5-6¢ observed in early data
+
+### Arb Gap Analysis Results (7.7 hours of data, 2026-03-26)
+
+**Tick-level profitability (Scenario B: Poly taker + Kalshi maker):**
+- **68.8% of all ticks are net profitable** after fees
+- Avg net gap on profitable ticks: **4.8¢ per $1 contract**
+- Best asset: BTC (79% profitable, avg 5.1¢) and XRP (67.8%, avg 6.8¢)
+- SOL worst (44.5% profitable, avg 2.8¢)
+
+**Per-candle execution simulation:**
+- 93% of candles have at least one arb opportunity (gap >= 2¢)
+- Avg best gap per candle: **15.9¢** (= $15.90 per $100 deployed)
+- At $100/trade, 1 trade/candle: **~$4,200/day extrapolated**
+- At $1,000/trade: **~$42,000/day extrapolated**
+
+**Gap persistence:**
+- Median streak duration: **1 second** (most gaps flash open/close)
+- But avg is 13.5s — pulled up by fat, long-lasting windows
+- Some windows last **minutes to hours** (longest: 3.3 hours on BTC)
+- 20% of windows last >= 5 seconds; 3% >= 30 seconds
+- Big gaps (>20¢) last avg **29 minutes** before closing
+
+**Fee regime change March 30, 2026:**
+- Polymarket taker formula changing: `0.25 * (p*(1-p))^2` → `0.072 * (p*(1-p))^1`
+- Peak fee goes from 1.56% to 1.80% — slightly higher across all prices
+- Impact on arb: minimal (~1% drop in daily PnL)
+
+**Combined fee breakdowns at p=0.50:**
+| Scenario | Combined Fee | Break-even Gap |
+|----------|-------------|----------------|
+| Poly taker + Kalshi taker (now) | 2.53¢ | ~3¢ |
+| Poly taker + Kalshi maker (now) | 0.78¢ | ~1¢ |
+| Poly taker + Kalshi taker (Mar 30) | 2.65¢ | ~3¢ |
+| Poly taker + Kalshi maker (Mar 30) | 0.90¢ | ~1¢ |
 
 **Known bugs fixed**:
 - `extra_headers` → `additional_headers` (websockets version on VPS)
@@ -127,11 +161,35 @@ outcomes:  candle_id, asset, outcome (Up/Down), ts
 | File | Purpose |
 |------|---------|
 | `arb_collector.py` | Live data collector — Poly + Kalshi side-by-side |
-| `arb_bot/kalshi_client.py` | Kalshi REST + WS client with RSA-PSS auth |
-| `arb_bot/polymarket_client.py` | Polymarket REST + WS client |
-| `arb_bot/arb_detector.py` | `check_arb()` function, `ArbState` class |
-| `arb_bot/main.py` | Full async arb bot (DRY_RUN mode) |
+| `arb_bot/config.py` | All constants, fee functions (auto-switches Mar 30), thresholds |
+| `arb_bot/kalshi_client.py` | Kalshi REST + WS — persistent session, RSA-PSS auth |
+| `arb_bot/polymarket_client.py` | Polymarket REST + WS — persistent session, placeholder order signing |
+| `arb_bot/arb_detector.py` | Reverse ticker index (O(1)), dedup cooldown, stale price rejection |
+| `arb_bot/executor.py` | Parallel execution, nanosecond latency tracking, SQLite trade log |
+| `arb_bot/main.py` | Entrypoint — session warmup, wires feeds + detector + executor |
+| `arb_bot/market_mapper.py` | Maps Poly markets to Kalshi tickers |
 | `arb_bot/live_prices.py` | Snapshot price checker — both platforms |
+| `arb_analysis.py` | Arb gap analysis (tick-level, per-asset, per-candle) |
+| `arb_analysis_v2.py` | Full fee scenario comparison + execution simulation |
+| `arb_gap_speed.py` | Gap persistence / closing speed analysis |
+
+### Arb Bot Architecture (built 2026-03-26)
+Optimized for sub-50ms execution:
+1. **Persistent aiohttp sessions** — TLS handshake once at startup, reused for every trade
+2. **Connection warmup** — throwaway GETs at startup to pre-establish TCP+TLS
+3. **Parallel legs** — both Poly and Kalshi orders fire simultaneously via `asyncio.gather()`
+4. **Reverse ticker index** — O(1) Kalshi ticker → condition_id lookup
+5. **Dedup** — won't re-fire same pair+direction within 500ms cooldown
+6. **Stale price rejection** — ignores prices older than 2 seconds
+7. **Latency tracking** — every trade logs detect→fire, per-leg, and total latency to SQLite
+
+**Measured latency from Ashburn VPS (no VPN):**
+| Target | Connect | Notes |
+|--------|---------|-------|
+| Kalshi API | 10ms | Same datacenter corridor |
+| Polymarket CLOB | 5ms | Same datacenter corridor |
+
+**Estimated execution speed (both legs parallel):** ~20-50ms without VPN
 
 ---
 
@@ -175,12 +233,23 @@ Peaks at 1.56% at p=0.50. Maker rebate = 20%.
 
 ---
 
+## VPN / Geo Requirement
+- **Polymarket blocks US IPs** — need a non-US IP to trade
+- User has **NordVPN** (Netherlands exit)
+- Running VPN on the VPS adds ~150-200ms to Polymarket leg (Ashburn → NL → Poly → NL → Ashburn)
+- **Recommended setup: Move bot to a Netherlands VPS (Hetzner, ~€4/mo)**
+  - Polymarket: direct from NL, no VPN needed, ~10-20ms
+  - Kalshi: NL → US, ~80-100ms (but Kalshi is maker side, speed doesn't matter)
+  - Total reaction time: ~90ms (vs ~200ms with NordVPN on Ashburn)
+  - Alternative: self-hosted WireGuard on NL VPS as proxy for Ashburn (~90-120ms)
+- **Kalshi is US-regulated, accessible from anywhere** — no VPN needed
+
 ## Next Steps
-1. **Analyze arb_collector.db** — download after 24h+ of data, measure:
-   - How often do gaps > 3¢ appear? (min profitable threshold after fees)
-   - How large are typical gaps?
-   - How long do gaps last? (determines if manual or bot execution is needed)
-   - Which assets have the most/biggest gaps?
-   - Do gaps correlate with time of day or market volatility?
-2. **Build the live arb executor** once gap analysis confirms edge
-3. **VPS storage**: expand boot volume to 200GB when approaching 25GB used
+1. **Set up Netherlands VPS** (Hetzner) for the arb bot — fastest Polymarket execution
+2. **Wire up real accounts:**
+   - Polymarket: need EIP-712 wallet signing for CLOB orders (placeholder in `polymarket_client.py`)
+   - Kalshi: credentials already in CLAUDE.md, RSA-PSS auth working
+3. **Deploy bot in DRY_RUN mode** on NL VPS — verify latency and opportunity detection live
+4. **Go live** once DRY_RUN confirms the edge matches backtest
+5. **Keep arb_collector running on Oracle VPS** — continuous data for analysis
+6. **VPS storage**: expand Oracle boot volume to 200GB when approaching 25GB used

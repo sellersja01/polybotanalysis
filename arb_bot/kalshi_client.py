@@ -1,22 +1,16 @@
 """
-Kalshi API client — auth + REST + WebSocket
+Kalshi API client — persistent session, RSA-PSS auth, WebSocket
 """
-import asyncio
 import base64
-import hashlib
 import json
-import os
 import time
-from pathlib import Path
 
 import aiohttp
 import websockets
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 
-
-KALSHI_WS_URL  = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
+from config import KALSHI_API_URL, KALSHI_WS_URL
 
 
 def load_private_key(path: str):
@@ -24,48 +18,70 @@ def load_private_key(path: str):
         return serialization.load_pem_private_key(f.read(), password=None)
 
 
-def sign(private_key, method: str, path: str, ts_ms: int) -> str:
+def sign_pss(private_key, method: str, path: str, ts_ms: int) -> str:
+    """RSA-PSS with SHA-256 — required by Kalshi."""
     msg = f"{ts_ms}{method}{path}".encode()
-    sig = private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    sig = private_key.sign(
+        msg,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
     return base64.b64encode(sig).decode()
 
 
-def auth_headers(key_id: str, private_key, method: str, path: str) -> dict:
-    ts = int(time.time() * 1000)
-    return {
-        "KALSHI-ACCESS-KEY":       key_id,
-        "KALSHI-ACCESS-TIMESTAMP": str(ts),
-        "KALSHI-ACCESS-SIGNATURE": sign(private_key, method, path, ts),
-        "Content-Type": "application/json",
-    }
-
-
 class KalshiClient:
-    def __init__(self, key_id: str, key_path: str):
+    """
+    High-speed Kalshi client.
+    Accepts an external aiohttp.ClientSession for connection reuse.
+    """
+
+    def __init__(self, key_id: str, key_path: str, session: aiohttp.ClientSession = None):
         self.key_id      = key_id
         self.private_key = load_private_key(key_path)
+        self._session    = session
+        self._owns_session = session is None
+
+        # Pre-encode the order path (used on every trade)
+        self._order_path = "/portfolio/orders"
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=10, keepalive_timeout=60),
+                timeout=aiohttp.ClientTimeout(total=5, connect=2),
+            )
+            self._owns_session = True
+        return self._session
 
     def _headers(self, method: str, path: str) -> dict:
-        return auth_headers(self.key_id, self.private_key, method, path)
+        ts = int(time.time() * 1000)
+        return {
+            "KALSHI-ACCESS-KEY":       self.key_id,
+            "KALSHI-ACCESS-TIMESTAMP": str(ts),
+            "KALSHI-ACCESS-SIGNATURE": sign_pss(self.private_key, method, path, ts),
+            "Content-Type": "application/json",
+        }
 
     async def get(self, path: str, params: dict = None) -> dict:
-        url = KALSHI_API_URL + path
-        headers = self._headers("GET", path)
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=headers, params=params) as r:
-                r.raise_for_status()
-                return await r.json()
+        s = await self._get_session()
+        async with s.get(KALSHI_API_URL + path,
+                         headers=self._headers("GET", path),
+                         params=params) as r:
+            r.raise_for_status()
+            return await r.json()
 
     async def post(self, path: str, body: dict) -> dict:
-        url = KALSHI_API_URL + path
-        headers = self._headers("POST", path)
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, headers=headers, json=body) as r:
-                r.raise_for_status()
-                return await r.json()
+        s = await self._get_session()
+        async with s.post(KALSHI_API_URL + path,
+                          headers=self._headers("POST", path),
+                          json=body) as r:
+            r.raise_for_status()
+            return await r.json()
 
     async def get_markets(self, series_ticker: str = None, status: str = "open") -> list:
-        """Fetch open markets, optionally filtered by series (e.g. 'KXBTC')."""
         params = {"status": status, "limit": 200}
         if series_ticker:
             params["series_ticker"] = series_ticker
@@ -74,44 +90,44 @@ class KalshiClient:
 
     async def place_order(self, ticker: str, side: str, price_cents: int,
                           count: int, post_only: bool = True) -> dict:
-        """
-        side: 'yes' or 'no'
-        price_cents: integer 1-99 (cents)
-        post_only: True = maker (0% fee), False = taker
-        """
         body = {
-            "ticker":       ticker,
-            "side":         side,
-            "action":       "buy",
-            "count":        count,
-            "yes_price":    price_cents if side == "yes" else 100 - price_cents,
-            "time_in_force": "immediate_or_cancel",
-            "post_only":    post_only,
+            "ticker":        ticker,
+            "side":          side,
+            "action":        "buy",
+            "count":         count,
+            "yes_price":     price_cents if side == "yes" else 100 - price_cents,
+            "time_in_force": "gtc" if post_only else "ioc",
+            "post_only":     post_only,
         }
-        return await self.post("/portfolio/orders", body)
+        return await self.post(self._order_path, body)
 
-    async def subscribe_ticker(self, tickers: list, callback):
-        """Stream real-time bid/ask for a list of market tickers."""
-        path   = "/trade-api/ws/v2"
-        ts     = int(time.time() * 1000)
-        sig    = sign(self.private_key, "GET", path, ts)
-        headers = {
+    async def cancel_order(self, order_id: str) -> dict:
+        return await self.post(f"/portfolio/orders/{order_id}/cancel", {})
+
+    def ws_headers(self) -> dict:
+        """Auth headers for WebSocket connection."""
+        path = "/trade-api/ws/v2"
+        ts = int(time.time() * 1000)
+        return {
             "KALSHI-ACCESS-KEY":       self.key_id,
             "KALSHI-ACCESS-TIMESTAMP": str(ts),
-            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-SIGNATURE": sign_pss(self.private_key, "GET", path, ts),
         }
-        async with websockets.connect(KALSHI_WS_URL, extra_headers=headers) as ws:
-            # Subscribe to ticker channel for each market
+
+    async def subscribe_ticker(self, tickers: list, callback):
+        headers = self.ws_headers()
+        async with websockets.connect(KALSHI_WS_URL,
+                                      additional_headers=headers) as ws:
             for i, ticker in enumerate(tickers):
                 await ws.send(json.dumps({
-                    "id":  i + 1,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels":      ["ticker"],
-                        "market_ticker": ticker,
-                    }
+                    "id": i + 1, "cmd": "subscribe",
+                    "params": {"channels": ["ticker"], "market_ticker": ticker},
                 }))
             async for raw in ws:
                 msg = json.loads(raw)
                 if msg.get("type") == "ticker":
                     await callback(msg)
+
+    async def close(self):
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
