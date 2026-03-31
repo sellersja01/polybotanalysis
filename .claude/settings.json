@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:coinsbench.com)",
+      "WebFetch(domain:www.trevorlasn.com)"
+    ]
+  }
+}

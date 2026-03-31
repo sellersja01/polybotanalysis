@@ -218,9 +218,70 @@ Peaks at 1.56% at p=0.50. Maker rebate = 20%.
 ## Wallet_7 Analysis (Concluded 2026-03-25)
 
 - **67.0% WR | +$42,154 net | 2.04% ROI** on 315 candles
-- **Conclusion**: Edge is NOT from directional prediction (share ratio only 1.04× — barely tilted)
-- **Hypothesis**: Exploiting cross-platform mispricings between Polymarket and Binance/Kalshi — same idea as our arb bot
+- **Conclusion**: Wallet_7 was almost certainly running **latency arbitrage** — monitoring Binance price and buying the correct side on Polymarket before odds reprice
 - IPWDCA strategy (two-sided symmetric DCA) tested and failed: -18% to -29% ROI
+
+---
+
+## NEW PRIMARY STRATEGY: Latency Arbitrage (Strategy 4, 2026-03-30)
+
+### The Edge
+Polymarket reprices its crypto Up/Down contracts **slower than Binance moves**. When BTC moves on Binance, there is a measurable lag before Polymarket odds reflect the move. During this lag, the bot buys the "correct" side at stale odds.
+
+### Backtest Results (184 hours, 1,258 candles, BTC 5m)
+Verified with our own local data (`market_btc_5m.db` — 2.66M Binance ticks + 5M Poly odds ticks):
+
+| Metric | Value |
+|--------|-------|
+| Lag events detected | 2,907 |
+| **Win rate** | **100%** (every trade profitable) |
+| **Avg profit per $100** | **$12.09** (12.1% ROI per trade) |
+| Avg lag (Binance → Poly) | 18.3 seconds |
+| Median lag | 7.5 seconds |
+| P10 lag (fastest 10%) | 0.96 seconds |
+| P25 lag | 2.6 seconds |
+| Daily PnL at $100/trade | ~$4,583/day |
+
+**"Catchable" trades (lag >= 1s):** 2,612 trades, 100% WR, $13.00/trade avg
+**"Easy" trades (lag >= 3s):** 2,107 trades, 100% WR, $15.04/trade avg
+
+### How It Works
+1. Monitor Binance BTC WebSocket for real-time price
+2. When BTC moves >= 0.05% in 15 seconds, determine direction (up/down)
+3. Check current Polymarket odds — if they haven't repriced yet, buy the correct side
+4. Exit after Polymarket reprices (typically 2-30 seconds later)
+
+### Why It Works
+- Polymarket is a CLOB — prices only update when traders post orders
+- After a Binance move, there's a 2-30 second window where Polymarket odds are stale
+- Buying the correct side at stale odds is not prediction — it's reading information that already exists
+- The lag has compressed from 12s (2024) to ~7.5s median (2026) but still very exploitable
+
+### Comparison to Cross-Platform Arb (Strategy 3)
+| | Latency Arb | Cross-Platform Arb |
+|---|---|---|
+| Platforms needed | Polymarket + Binance (free feed) | Polymarket + Kalshi |
+| Capital locked | 1 platform | 2 platforms |
+| Win rate | **100%** (backtest) | ~100% (risk-free) |
+| Avg profit/trade | **$12.09 per $100** | $4.80 per $100 |
+| Complexity | Simpler (one trade) | Two coordinated trades |
+| Risk | Lag shrinking over time | One leg fails |
+| Daily PnL ($100/trade) | **~$4,583** | ~$4,200 |
+
+**Latency arb is the primary strategy. Cross-platform arb is secondary/backup.**
+
+### Risk: Edge Compression
+- Lag was 12s in 2024, now ~7.5s median. Trend is clear — more bots = shorter window
+- At some point the lag will be smaller than execution latency (~50-200ms with VPN)
+- Treat this as a **time-limited opportunity** — extract value while edge exists
+- Pivot to cross-platform arb or market making when latency arb stops working
+
+### Risk Management (from 0x8dxd analysis)
+- Max single position: **8% of portfolio**
+- Daily loss limit: **-20%** with automatic halt
+- Total drawdown kill switch: **-40%**
+- Position sizing: **Kelly Criterion**
+- Paper trade for **minimum 1 week** (200+ trades) before going live
 
 ---
 
@@ -245,11 +306,16 @@ Peaks at 1.56% at p=0.50. Maker rebate = 20%.
 - **Kalshi is US-regulated, accessible from anywhere** — no VPN needed
 
 ## Next Steps
-1. **Set up Netherlands VPS** (Hetzner) for the arb bot — fastest Polymarket execution
-2. **Wire up real accounts:**
-   - Polymarket: need EIP-712 wallet signing for CLOB orders (placeholder in `polymarket_client.py`)
-   - Kalshi: credentials already in CLAUDE.md, RSA-PSS auth working
-3. **Deploy bot in DRY_RUN mode** on NL VPS — verify latency and opportunity detection live
-4. **Go live** once DRY_RUN confirms the edge matches backtest
-5. **Keep arb_collector running on Oracle VPS** — continuous data for analysis
-6. **VPS storage**: expand Oracle boot volume to 200GB when approaching 25GB used
+1. **Build the latency arb bot** — monitor Binance WS + Polymarket WS, detect lag, execute trades
+   - Reuse existing `arb_bot/` infrastructure (persistent sessions, executor, latency tracking)
+   - Add Binance WebSocket price feed
+   - Add edge detection: compare Binance price move vs current Poly odds
+   - DRY_RUN mode first with full latency logging
+2. **Set up Netherlands VPS** (Hetzner, ~€4/mo) — run bot there for fastest Polymarket execution
+3. **Wire up Polymarket account:**
+   - Need EIP-712 wallet signing for CLOB orders (placeholder in `polymarket_client.py`)
+   - Fund with USDC on Polygon network
+4. **Paper trade for 1+ week** — verify 70%+ WR on 200+ trades before going live
+5. **Go live small** — $1-5/trade, scale gradually on evidence
+6. **Keep cross-platform arb as backup** — secondary income stream + fallback when latency arb edge compresses
+7. **Keep arb_collector running on Oracle VPS** — continuous data collection
