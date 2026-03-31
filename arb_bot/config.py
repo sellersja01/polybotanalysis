@@ -27,15 +27,15 @@ KALSHI_SERIES = {
     "SOL": "KXSOL15M",
     "XRP": "KXXRP15M",
 }
-ASSETS = ["BTC"]   # BTC only for first live test
+ASSETS = ["BTC"]
 
 # ── Trading config ────────────────────────────────────────────────────────────
-DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() != "false"
-SHARES_PER_TRADE = int(os.environ.get("SHARES_PER_TRADE", "5"))   # min 5 shares for Polymarket limit orders
-MAX_TRADES_PER_CANDLE = 1    # max 1 trade per TRADE_WINDOW
+DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() != "false"  # default: DRY RUN
+SHARES_PER_TRADE = int(os.environ.get("SHARES_PER_TRADE", "10"))  # higher = less relative rounding error on Kalshi
+MAX_TRADES_PER_CANDLE = 3    # max 3 trades per TRADE_WINDOW
 TRADE_WINDOW          = 900  # 15-minute trade window (aligns with candle)
-MIN_PROFIT_CENTS = 1.0   # min net profit per $1 contract (cents) to fire
-DEDUP_COOLDOWN   = 30.0  # seconds between fires on same pair+direction
+MIN_PROFIT_CENTS = 2.0   # min net profit per $1 contract (cents) to fire
+DEDUP_COOLDOWN   = 10.0  # seconds between fires on same pair+direction
 STALE_PRICE_MS   = 12000  # reject arbs if either price older than this (ms)
 CANDLE_INTERVAL  = 900   # 15 minutes in seconds
 

@@ -85,17 +85,19 @@ class PolymarketClient:
         try:
             from py_clob_client.clob_types import MarketOrderArgs
 
-            # Market order: spend size*price USDC — fills immediately at AMM price
-            amount = round(size * price, 4)
+            # Market order — sweeps AMM at current price, guaranteed fill
+            # amount = USDC to spend (shares * price)
+            amount = round(size * price, 2)
             args = MarketOrderArgs(
                 token_id=token_id,
                 amount=amount,
                 side="BUY",
             )
             signed = await asyncio.to_thread(self._clob.create_market_order, args)
-            resp   = await asyncio.to_thread(self._clob.post_order, signed, "FOK")
-            if not (resp.get("success") or resp.get("status") == "matched"):
-                raise RuntimeError(f"Market order not filled: {resp}")
+            resp   = await asyncio.to_thread(self._clob.post_order, signed, "FAK")
+            taking = float(resp.get("takingAmount", 0))
+            if taking <= 0:
+                raise RuntimeError(f"Market order filled 0 shares: {resp}")
             return resp
 
         except RuntimeError:

@@ -102,6 +102,11 @@ class Executor:
         if not self._check_candle_limit(symbol):
             return result  # silently skip — already traded this candle
 
+        # ref_price_gap check disabled — re-enable once validated
+        # ref_gap = pair.get("ref_price_gap")
+        # if ref_gap is not None and ref_gap > 6.0:
+        #     return result
+
         # Time from detection to execution start
         detect_ts = opp.get("detect_ts", time.time())
         result.latency_detect_ms = (time.time() - detect_ts) * 1000
@@ -150,7 +155,8 @@ class Executor:
         else:
             k_side = "no" if k_yes_is_up else "yes"
 
-        k_price_cents = int(opp["kalshi_ask"] * 100)
+        # Add 10¢ buffer so limit order crosses the spread and fills immediately
+        k_price_cents = min(int(opp["kalshi_ask"] * 100) + 10, 99)
         is_maker = opp["kalshi_mode"] == "maker"
 
         async def fire_poly():
@@ -202,11 +208,11 @@ class Executor:
 
             result.poly_result = str(poly_r)[:200]
 
-            # Match Kalshi shares to exactly what Poly filled
+            # Match Kalshi to Poly fill — round to 1 decimal place
             poly_filled = float(poly_resp.get("takingAmount", shares))
-            kalshi_shares = max(1, round(poly_filled))
+            kalshi_shares = max(1, round(poly_filled))  # Kalshi API requires integer
             if kalshi_shares != shares:
-                print(f"  Poly filled {poly_filled:.2f} shares — matching Kalshi to {kalshi_shares}")
+                print(f"  Poly filled {poly_filled:.4f} shares — Kalshi buying {kalshi_shares}")
 
             # Poly confirmed filled — now fire Kalshi with matched share count
             t0 = time.perf_counter_ns()

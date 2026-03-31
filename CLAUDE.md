@@ -235,22 +235,45 @@ clob.set_api_creds(creds)
 ```
 
 #### Polymarket order execution — confirmed working approach
-- **Use `MarketOrderArgs` with `amount = size * price` USDC** — fills immediately at AMM price
-- **`signature_type=2` + `funder=0x6826c...`** — required or you get "balance: 0" error
-- **`post_order(signed, "FOK")`** — FOK works with market orders
-- `price=0.99` limit orders give wrong share count (e.g., 6.4 instead of 5) — don't use
-- FOK limit orders at exact price fail: "order couldn't be fully filled" — don't use
+- **Use `MarketOrderArgs` with `amount = size * price` USDC + `side="BUY"`** — fills immediately at AMM price
+- **`post_order(signed, "FAK")`** — FAK (not FOK) for market orders; FOK fails with "order couldn't be fully filled"
+- `signature_type=2` + `funder=0x6826c...` required or you get "balance: 0" error
+- Limit orders (OrderArgs + FAK/FOK) fail with "no orders found to match" — AMM has no depth at exact price
+- AMM fills ~3.7 shares when requesting 5 at $2.90 (slippage eats into share count)
 
 #### Share matching between legs
-- Polymarket AMM may fill fewer shares than requested (e.g., 3.5 instead of 5)
-- **Executor reads `takingAmount` from Poly response and matches Kalshi to that exact number**
+- Polymarket AMM fills a non-integer number of shares (e.g. 3.7179)
+- Executor reads `takingAmount` from Poly response → rounds to nearest integer → sends to Kalshi
+- **Kalshi `count` field is strictly an integer** — rejects ALL decimals (3.7, 6.2, 4.6, 2.0) with `"cannot unmarshal number X into Go struct field CreateOrderRequest.count of type int"`
 - Kalshi fires AFTER Poly confirms fill — no unhedged positions
+- Max share mismatch = 0.5 shares (round to nearest integer)
+
+#### Kalshi order placement — updated
+- **Remove `time_in_force` and `post_only`** — cause 400 errors
+- **`count` must be an integer** — `int(round(float(count)))`
+- Add **+10¢ buffer** to `k_price_cents` so limit order crosses spread immediately: `min(int(kalshi_ask * 100) + 10, 99)`
+- Without buffer, GTC order sits resting when price moves away
+
+#### Current bot config (2026-03-28 evening)
+- `SHARES_PER_TRADE = 10` (raised from 5 to reduce relative rounding error)
+- `MAX_TRADES_PER_CANDLE = 3`
+- `MIN_PROFIT_CENTS = 2.0` (lowered from 5.0 — 2¢ is profitable above break-even)
+- `DRY_RUN` defaults to `true` — must explicitly set `$env:DRY_RUN = "false"` to go live
+
+#### Reference price gap filter (IN PROGRESS — not yet validated)
+- Polymarket "price to beat" and Kalshi "at least" target price should match each candle
+- If gap > $6, platforms are tracking different strike prices — arb may not hedge correctly
+- `market_mapper.py` now fetches `poly_ref_price` and `kalshi_ref_price` for each pair
+- **TODO**: Validate that the correct API fields are being read (check `ref_gap=` in startup logs)
+  - Polymarket: trying `event.startValue` / `start_value` / `openValue` / `open_value`
+  - Kalshi: trying `floor_strike` / `cap_strike` / `strike` / `yes_sub_title`
+  - If startup shows `ref_gap=unknown`, fields are wrong and need to be fixed
 
 #### Successful trades confirmed
 - Kalshi: 201 responses, shares filled correctly
 - Polymarket: 200 `"status": "matched", "success": true`
-- One confirmed `fired=1 success=1 profit=$1.19` on 2026-03-28
-- Both legs executing live as of 2026-03-29
+- Multiple confirmed live trades on 2026-03-28 evening
+- Both legs executing reliably as of 2026-03-28
 
 ---
 
@@ -311,10 +334,12 @@ Peaks at 1.56% at p=0.50. Maker rebate = 20%.
 - [ ] Deploy to Hetzner VPS (Monday)
 
 ## Next Steps
-1. ~~Fix Polymarket FOK fill issue~~ — DONE: using MarketOrderArgs + share matching
-2. Spin up Hetzner CX22 (Falkenstein, Ubuntu 24.04)
-3. Deploy bot on Hetzner — EU IP, no VPN needed for Polymarket, ~10ms latency
-4. Run at higher share counts once execution is stable on Hetzner
+1. ~~Fix Polymarket FOK fill issue~~ — DONE: using MarketOrderArgs + FAK + share matching
+2. ~~Fix Kalshi integer count~~ — DONE: `int(round(poly_filled))`
+3. ~~Add +10¢ buffer to Kalshi price~~ — DONE: prevents GTC resting orders
+4. **Validate reference price gap filter** — run in DRY_RUN, check startup logs show `ref_gap=$X.XX` not `unknown`. Fix field names if needed.
+5. Spin up Hetzner CX22 (Falkenstein, Ubuntu 24.04)
+6. Deploy bot on Hetzner — EU IP, no VPN needed for Polymarket, ~10ms latency
 
 ## Environment Setup (each new terminal session)
 ```powershell

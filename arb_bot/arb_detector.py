@@ -25,8 +25,8 @@ def check_arb(poly_up_ask: float, poly_down_ask: float,
         (poly_up_ask,   k_down_ask, "poly_up",   "kalshi_down"),
         (poly_down_ask, k_up_ask,   "poly_down", "kalshi_up"),
     ]:
-        if poly_ask <= 0 or k_ask <= 0 or poly_ask >= 1 or k_ask >= 1:
-            continue
+        if poly_ask <= 0.10 or k_ask <= 0.10 or poly_ask >= 0.90 or k_ask >= 0.90:
+            continue  # near resolution — no liquidity
 
         cost = poly_ask + k_ask
 
@@ -88,6 +88,10 @@ class ArbState:
         # Dedup: (cond_id, direction) -> last_fire_time
         self._last_fire = {}
 
+        # Rate-limited log timestamps
+        self._last_gap_log   = {}
+        self._last_stale_log = {}
+
     def update_poly(self, condition_id: str, up_bid: float, up_ask: float,
                     down_bid: float, down_ask: float):
         self.poly_prices[condition_id] = {
@@ -127,10 +131,31 @@ class ArbState:
 
         # Reject stale prices
         now = time.time()
-        if (now - pp["ts"]) * 1000 > STALE_PRICE_MS:
+        poly_age_ms = (now - pp["ts"]) * 1000
+        kals_age_ms = (now - kp["ts"]) * 1000
+        if poly_age_ms > STALE_PRICE_MS:
+            sym = pair.get("symbol", "?")
+            if now - self._last_stale_log.get(condition_id, 0) > 10:
+                print(f"[arb] {sym}: poly price stale ({poly_age_ms:.0f}ms) — skipping", flush=True)
+                self._last_stale_log[condition_id] = now
             return
-        if (now - kp["ts"]) * 1000 > STALE_PRICE_MS:
+        if kals_age_ms > STALE_PRICE_MS:
+            sym = pair.get("symbol", "?")
+            if now - self._last_stale_log.get(condition_id, 0) > 10:
+                print(f"[arb] {sym}: kalshi price stale ({kals_age_ms:.0f}ms) — skipping", flush=True)
+                self._last_stale_log[condition_id] = now
             return
+
+        # Log current gap every 10s so we can see if opportunities exist
+        sym = pair.get("symbol", "?")
+        gap1 = round(1.0 - pp["up_ask"] - kp["dn_ask"], 4)
+        gap2 = round(1.0 - pp["dn_ask"] - kp["up_ask"], 4)
+        best = max(gap1, gap2)
+        if now - self._last_gap_log.get(condition_id, 0) > 10:
+            print(f"[arb] {sym}: poly_up={pp['up_ask']:.3f} poly_dn={pp['dn_ask']:.3f} "
+                  f"kals_up={kp['up_ask']:.3f} kals_dn={kp['dn_ask']:.3f} "
+                  f"best_gap={best:+.4f}", flush=True)
+            self._last_gap_log[condition_id] = now
 
         opp = check_arb(
             pp["up_ask"], pp["dn_ask"],

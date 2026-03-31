@@ -97,6 +97,7 @@ async def run_kalshi_feed(kalshi: KalshiClient, state: ArbState,
                         no_bid  = round(1.0 - yes_ask, 4)
                         no_ask  = round(1.0 - yes_bid, 4)
 
+                        print(f"[kalshi] {ticker}: yes_bid={yes_bid:.3f} yes_ask={yes_ask:.3f}", flush=True)
                         state.update_kalshi(ticker, yes_bid, yes_ask, no_bid, no_ask)
                     except Exception:
                         pass
@@ -192,6 +193,47 @@ async def run_poly_feed(state: ArbState, get_pairs, stop_event: asyncio.Event):
                 await asyncio.sleep(3)
 
 
+# ── Polymarket RTDS Chainlink feed (captures BTC price at each candle open) ───
+async def run_rtds_feed(state_container: dict, stop_event: asyncio.Event):
+    RTDS_URL = "wss://ws-live-data.polymarket.com"
+    sub = json.dumps({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": json.dumps({"symbol": "btc/usd"})
+        }]
+    })
+    state_container.setdefault("candle_ref_prices", {})
+
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(RTDS_URL, ping_interval=20) as ws:
+                await ws.send(sub)
+                async for raw in ws:
+                    if stop_event.is_set():
+                        break
+                    if not raw:
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                        points = msg.get("payload", {}).get("data", [])
+                        for pt in points:
+                            ts_s = pt["timestamp"] / 1000
+                            price = float(pt["value"])
+                            candle_ts = (int(ts_s) // CANDLE_INTERVAL) * CANDLE_INTERVAL
+                            ref = state_container["candle_ref_prices"]
+                            if candle_ts not in ref:
+                                ref[candle_ts] = price
+                                print(f"[rtds] candle {candle_ts} open: ${price:,.2f}", flush=True)
+                    except Exception:
+                        pass
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"[rtds] error: {e} — reconnecting in 3s", flush=True)
+                await asyncio.sleep(3)
+
+
 # ── Candle rollover manager ───────────────────────────────────────────────────
 async def candle_manager(kalshi_session: aiohttp.ClientSession,
                          poly_session: aiohttp.ClientSession,
@@ -216,9 +258,17 @@ async def candle_manager(kalshi_session: aiohttp.ClientSession,
 
         print("[candle] rolling over — fetching new markets...", flush=True)
         try:
+            # Wait up to 5s for RTDS to capture the new candle's open price
+            poly_ref = None
+            for _ in range(10):
+                poly_ref = state_container.get("candle_ref_prices", {}).get(candle_end)
+                if poly_ref:
+                    break
+                await asyncio.sleep(0.5)
             new_pairs = await build_map(
                 poly_session, kalshi,
-                min_open_ts=candle_end,  # wait for Kalshi to publish new candle
+                min_open_ts=candle_end,
+                poly_ref_price=poly_ref,
             )
             if new_pairs:
                 state_container["pairs"] = new_pairs
@@ -296,7 +346,8 @@ async def run_poly_gamma_poller(session: aiohttp.ClientSession, state_container:
                 if up_mid <= 0.02 or up_mid >= 0.98:
                     continue  # settled, skip
 
-                proxy_state.update_poly(cond, up_mid, up_mid, dn_mid, dn_mid)
+                # Gamma gives mid price — estimate ask as mid+0.01 (1¢ spread)
+                proxy_state.update_poly(cond, up_mid - 0.01, up_mid + 0.01, dn_mid - 0.01, dn_mid + 0.01)
                 print(f"[poly] {asset}: up={up_mid:.3f} dn={dn_mid:.3f}", flush=True)
 
             except Exception as e:
@@ -439,6 +490,7 @@ async def main():
             run_kalshi_feed(kalshi, proxy_state, get_tickers, stop_event),
             run_poly_feed(proxy_state, get_pairs, stop_event),
             run_poly_gamma_poller(poly_session, state_container, proxy_state, stop_event),
+            run_rtds_feed(state_container, stop_event),
             candle_manager(kalshi_session, poly_session, kalshi,
                            state_container, executor, stop_event),
             stats_printer(executor, state_container, stop_event),
