@@ -228,22 +228,44 @@ Peaks at 1.56% at p=0.50. Maker rebate = 20%.
 ### The Edge
 Polymarket reprices its crypto Up/Down contracts **slower than Binance moves**. When BTC moves on Binance, there is a measurable lag before Polymarket odds reflect the move. During this lag, the bot buys the "correct" side at stale odds.
 
-### Backtest Results (184 hours, 1,258 candles, BTC 5m)
-Verified with our own local data (`market_btc_5m.db` — 2.66M Binance ticks + 5M Poly odds ticks):
+### Backtest Results — HONEST (184 hours, BTC 5m, 30s exit)
+Enter on EVERY BTC move >= 0.05% in 15s. No cherry-picking. Track real outcomes.
 
 | Metric | Value |
 |--------|-------|
-| Lag events detected | 2,907 |
-| **Win rate** | **100%** (every trade profitable) |
-| **Avg profit per $100** | **$12.09** (12.1% ROI per trade) |
-| Avg lag (Binance → Poly) | 18.3 seconds |
-| Median lag | 7.5 seconds |
-| P10 lag (fastest 10%) | 0.96 seconds |
-| P25 lag | 2.6 seconds |
-| Daily PnL at $100/trade | ~$4,583/day |
+| Total trades | 2,398 |
+| **Win rate** | **49.5%** |
+| **Avg win** | **+$23.25** per $100 |
+| **Avg loss** | **-$3.60** per $100 |
+| **Win/Loss ratio** | **6.47x** (wins 6.5x bigger than losses) |
+| Avg profit per trade | +$9.68 per $100 |
+| Max loss | -$61.32 (entry at 0.90 — too high) |
+| Median loss | -$1.22 (most losses are tiny) |
+| Daily PnL at $100/trade | ~$3,027/day |
 
-**"Catchable" trades (lag >= 1s):** 2,612 trades, 100% WR, $13.00/trade avg
-**"Easy" trades (lag >= 3s):** 2,107 trades, 100% WR, $15.04/trade avg
+**Key insight: edge is NOT win rate — it's asymmetry.** Wins average $23, losses average $3.60.
+
+### Backtest Results — ALL MARKETS (184 hours, 30s exit)
+| Market | Trades | WR% | Avg $/trade | Daily PnL | Median Lag |
+|--------|--------|-----|-------------|-----------|------------|
+| BTC 5m | 2,398 | 49.5% | +$9.68 | $3,027/day | 7.5s |
+| BTC 15m | 2,205 | 48.6% | +$6.73 | $1,485/day | 6.8s |
+| ETH 5m | 3,487 | 47.4% | +$10.88 | $3,793/day | 4.7s |
+| ETH 15m | 3,490 | 48.6% | +$7.03 | $3,605/day | 4.6s |
+| SOL 15m | 3,638 | 48.3% | +$7.66 | $4,089/day | 6.3s |
+| XRP 15m | 3,428 | 48.0% | +$7.80 | $3,929/day | 6.3s |
+| **TOTAL** | **19,772** | | | **~$25,026/day** | |
+
+### Max Entry Price Sweep (BTC 5m backtest)
+| Max Entry | Trades | WR% | Avg Loss | Max Loss | $/day |
+|-----------|--------|-----|----------|----------|-------|
+| 0.40 | 1,665 | 48.3% | -$3.20 | -$38 | $2,311 |
+| 0.50 | 2,179 | 47.9% | -$3.41 | -$49 | $2,764 |
+| 0.60 | 2,397 | 49.5% | -$3.55 | -$50 | **$3,035** |
+| 0.70 | 2,398 | 49.5% | -$3.60 | -$61 | $3,027 |
+| 0.80+ | 2,398 | 49.5% | -$3.60 | -$61 | $3,027 |
+
+Above 0.60 adds no trades but increases max loss. Big losses (-$64 live) come from entries > 0.80.
 
 ### How It Works
 1. Monitor Binance BTC WebSocket for real-time price
@@ -262,13 +284,43 @@ Verified with our own local data (`market_btc_5m.db` — 2.66M Binance ticks + 5
 |---|---|---|
 | Platforms needed | Polymarket + Binance (free feed) | Polymarket + Kalshi |
 | Capital locked | 1 platform | 2 platforms |
-| Win rate | **100%** (backtest) | ~100% (risk-free) |
-| Avg profit/trade | **$12.09 per $100** | $4.80 per $100 |
+| Win rate | ~49% (but 6.5x win/loss ratio) | ~100% (risk-free) |
+| Avg profit/trade | **$9.68 per $100** | $4.80 per $100 |
 | Complexity | Simpler (one trade) | Two coordinated trades |
 | Risk | Lag shrinking over time | One leg fails |
-| Daily PnL ($100/trade) | **~$4,583** | ~$4,200 |
+| Daily PnL ($100/trade) | **~$3,027** (BTC 5m alone) | ~$4,200 |
 
 **Latency arb is the primary strategy. Cross-platform arb is secondary/backup.**
+
+### Live Paper Trading Results (2026-03-30)
+- Ran `paper_test.py` on laptop — connects to public Binance + Polymarket WebSockets
+- **First session**: 5 trades, 5 wins, +$89.58 in 5 minutes
+- **Second session**: 41 trades, 36 wins (88%), +$121.91
+- Big losses came from entries at 0.82-0.94 ask — fixed by capping max entry
+- Bot only enters when BTC is moving (>0.05% in 15s) — goes quiet in flat markets
+- **Cannot run on Oracle VPS** — Binance.com blocks US IPs (HTTP 451)
+- Binance.us works but has almost no volume (3 ticks/20s vs 6,000/min on .com)
+
+### Latency Bot Files (built 2026-03-30)
+| File | Purpose |
+|------|---------|
+| `arb_bot/binance_feed.py` | Real-time BTC price from Binance WS, rolling buffer, move detection |
+| `arb_bot/latency_detector.py` | Compares Binance moves vs Poly odds, fires signal when stale |
+| `arb_bot/latency_bot.py` | Main bot — wires feeds + detector + executor, DRY_RUN, SQLite logging |
+| `arb_bot/paper_test.py` | Self-contained paper trading test (no auth needed) |
+| `latency_lag_v2.py` | Fast backtest — loads all data into memory |
+| `latency_lag_honest.py` | Honest backtest — enters on every signal, no cherry-picking |
+| `latency_lag_all.py` | Multi-market backtest (BTC/ETH/SOL/XRP × 5m/15m) |
+
+### Paper Test Config (`paper_test.py`)
+```python
+LOOKBACK = 15        # BTC move lookback (seconds)
+MOVE_THRESH = 0.05   # min BTC move % to trigger
+COOLDOWN = 2         # seconds between trades
+MAX_ENTRY_PRICE = 0.80  # don't buy above this
+MAX_OPEN = 5         # max simultaneous open trades
+EXIT_TIMEOUT = 60    # close after 60s if no 2c reprice
+```
 
 ### Risk: Edge Compression
 - Lag was 12s in 2024, now ~7.5s median. Trend is clear — more bots = shorter window
@@ -306,16 +358,16 @@ Verified with our own local data (`market_btc_5m.db` — 2.66M Binance ticks + 5
 - **Kalshi is US-regulated, accessible from anywhere** — no VPN needed
 
 ## Next Steps
-1. **Build the latency arb bot** — monitor Binance WS + Polymarket WS, detect lag, execute trades
-   - Reuse existing `arb_bot/` infrastructure (persistent sessions, executor, latency tracking)
-   - Add Binance WebSocket price feed
-   - Add edge detection: compare Binance price move vs current Poly odds
-   - DRY_RUN mode first with full latency logging
-2. **Set up Netherlands VPS** (Hetzner, ~€4/mo) — run bot there for fastest Polymarket execution
-3. **Wire up Polymarket account:**
+1. **Set up Netherlands VPS** (Hetzner, ~€4/mo) — required because:
+   - Binance.com blocks US IPs (Oracle VPS in Ashburn gets HTTP 451)
+   - Polymarket blocks US IPs (needs non-US IP)
+   - NL VPS solves both: Binance accessible, Polymarket accessible, no VPN needed
+2. **Wire up Polymarket account:**
    - Need EIP-712 wallet signing for CLOB orders (placeholder in `polymarket_client.py`)
    - Fund with USDC on Polygon network
-4. **Paper trade for 1+ week** — verify 70%+ WR on 200+ trades before going live
-5. **Go live small** — $1-5/trade, scale gradually on evidence
+3. **Deploy latency bot on NL VPS** in DRY_RUN mode — verify latency and live signals
+4. **Go live small** — $1-5/trade, scale gradually on evidence
+5. **Add multi-asset support** — ETH 5m showed even more signals than BTC in backtest
 6. **Keep cross-platform arb as backup** — secondary income stream + fallback when latency arb edge compresses
 7. **Keep arb_collector running on Oracle VPS** — continuous data collection
+8. **Download wallet_trades.db** — gzip likely done on VPS, grab it next session
