@@ -177,19 +177,103 @@ outcomes:  candle_id, asset, outcome (Up/Down), ts
 Optimized for sub-50ms execution:
 1. **Persistent aiohttp sessions** — TLS handshake once at startup, reused for every trade
 2. **Connection warmup** — throwaway GETs at startup to pre-establish TCP+TLS
-3. **Parallel legs** — both Poly and Kalshi orders fire simultaneously via `asyncio.gather()`
+3. **Sequential legs** — Polymarket fires first; if it fails, Kalshi never fires (prevents unhedged positions)
 4. **Reverse ticker index** — O(1) Kalshi ticker → condition_id lookup
-5. **Dedup** — won't re-fire same pair+direction within 500ms cooldown
-6. **Stale price rejection** — ignores prices older than 2 seconds
+5. **Dedup** — won't re-fire same pair+direction within 30s cooldown
+6. **Stale price rejection** — ignores prices older than 12s
 7. **Latency tracking** — every trade logs detect→fire, per-leg, and total latency to SQLite
 
-**Measured latency from Ashburn VPS (no VPN):**
-| Target | Connect | Notes |
-|--------|---------|-------|
-| Kalshi API | 10ms | Same datacenter corridor |
-| Polymarket CLOB | 5ms | Same datacenter corridor |
+**Measured latency from PC (local):** ~800ms total (acceptable since gaps last seconds to minutes)
 
-**Estimated execution speed (both legs parallel):** ~20-50ms without VPN
+---
+
+### Live Trading — Confirmed Working (2026-03-28)
+
+**Bot successfully placed real orders on both platforms.**
+
+#### Credentials / Wallet Setup
+- **Polymarket proxy wallet** (where funds sit): `0x6826c3197fff281144b07fe6c3e72636854769ab`
+- **MetaMask EOA** (signs transactions): `0x4795e77317792011c8967de46441f586987101fc`
+- **Polymarket API key**: `019d323e-f149-794e-8c3b-6c1df3877250`
+- **POLY_PRIVATE_KEY** env var = MetaMask private key for `0x4795e...`
+- **KALSHI_KEY_PATH** env var = `C:\Users\James\kalshi_key.pem.txt`
+
+#### Run the bot
+```powershell
+$env:DRY_RUN = "false"
+$env:POLY_PRIVATE_KEY = "0x<metamask_private_key>"
+python main.py
+```
+
+#### py_clob_client API (local version — differs from docs)
+- **No `LimitOrderArgs`** — use `OrderArgs` from `py_clob_client.clob_types`
+- **No `BUY` constant** — use the string `"BUY"` directly
+- **No `create_limit_order`** — use `clob.create_order(args)`
+- **`post_order(signed, order_type)`** — use `"FOK"` (Fill or Kill) for arb
+- `OrderType` enum only has `"GTC"`, `"FOK"`, `"GTD"` — `"IOC"` is not valid, defaults to GTC
+
+#### ClobClient initialization (proxy wallet mode)
+```python
+from py_clob_client.client import ClobClient
+clob = ClobClient(
+    host=POLY_CLOB_URL,
+    key=POLY_PRIVATE_KEY,       # MetaMask EOA private key
+    chain_id=137,                # Polygon
+    signature_type=2,            # proxy wallet mode
+    funder="0x6826c3197fff281144b07fe6c3e72636854769ab",  # proxy wallet
+)
+creds = clob.create_or_derive_api_creds()
+clob.set_api_creds(creds)
+```
+
+#### Kalshi order placement — confirmed working
+- **Signing path**: must include `/trade-api/v2` prefix — sign `f"{ts}POST/trade-api/v2/portfolio/orders"`
+- **Remove `time_in_force` and `post_only`** from order body — these fields cause 400 validation errors
+- Body format that works:
+```python
+{"ticker": ticker, "side": side, "action": "buy", "count": count, "yes_price": price_cents}
+```
+
+#### Polymarket order execution — confirmed working approach
+- **Use `MarketOrderArgs` with `amount = size * price` USDC + `side="BUY"`** — fills immediately at AMM price
+- **`post_order(signed, "FAK")`** — FAK (not FOK) for market orders; FOK fails with "order couldn't be fully filled"
+- `signature_type=2` + `funder=0x6826c...` required or you get "balance: 0" error
+- Limit orders (OrderArgs + FAK/FOK) fail with "no orders found to match" — AMM has no depth at exact price
+- AMM fills ~3.7 shares when requesting 5 at $2.90 (slippage eats into share count)
+
+#### Share matching between legs
+- Polymarket AMM fills a non-integer number of shares (e.g. 3.7179)
+- Executor reads `takingAmount` from Poly response → rounds to nearest integer → sends to Kalshi
+- **Kalshi `count` field is strictly an integer** — rejects ALL decimals (3.7, 6.2, 4.6, 2.0) with `"cannot unmarshal number X into Go struct field CreateOrderRequest.count of type int"`
+- Kalshi fires AFTER Poly confirms fill — no unhedged positions
+- Max share mismatch = 0.5 shares (round to nearest integer)
+
+#### Kalshi order placement — updated
+- **Remove `time_in_force` and `post_only`** — cause 400 errors
+- **`count` must be an integer** — `int(round(float(count)))`
+- Add **+10¢ buffer** to `k_price_cents` so limit order crosses spread immediately: `min(int(kalshi_ask * 100) + 10, 99)`
+- Without buffer, GTC order sits resting when price moves away
+
+#### Current bot config (2026-03-28 evening)
+- `SHARES_PER_TRADE = 10` (raised from 5 to reduce relative rounding error)
+- `MAX_TRADES_PER_CANDLE = 3`
+- `MIN_PROFIT_CENTS = 2.0` (lowered from 5.0 — 2¢ is profitable above break-even)
+- `DRY_RUN` defaults to `true` — must explicitly set `$env:DRY_RUN = "false"` to go live
+
+#### Reference price gap filter (IN PROGRESS — not yet validated)
+- Polymarket "price to beat" and Kalshi "at least" target price should match each candle
+- If gap > $6, platforms are tracking different strike prices — arb may not hedge correctly
+- `market_mapper.py` now fetches `poly_ref_price` and `kalshi_ref_price` for each pair
+- **TODO**: Validate that the correct API fields are being read (check `ref_gap=` in startup logs)
+  - Polymarket: trying `event.startValue` / `start_value` / `openValue` / `open_value`
+  - Kalshi: trying `floor_strike` / `cap_strike` / `strike` / `yes_sub_title`
+  - If startup shows `ref_gap=unknown`, fields are wrong and need to be fixed
+
+#### Successful trades confirmed
+- Kalshi: 201 responses, shares filled correctly
+- Polymarket: 200 `"status": "matched", "success": true`
+- Multiple confirmed live trades on 2026-03-28 evening
+- Both legs executing reliably as of 2026-03-28
 
 ---
 
@@ -348,14 +432,19 @@ EXIT_TIMEOUT = 60    # close after 60s if no 2c reprice
 
 ## VPN / Geo Requirement
 - **Polymarket blocks US IPs** — need a non-US IP to trade
-- User has **NordVPN** (Netherlands exit)
-- Running VPN on the VPS adds ~150-200ms to Polymarket leg (Ashburn → NL → Poly → NL → Ashburn)
-- **Recommended setup: Move bot to a Netherlands VPS (Hetzner, ~€4/mo)**
-  - Polymarket: direct from NL, no VPN needed, ~10-20ms
-  - Kalshi: NL → US, ~80-100ms (but Kalshi is maker side, speed doesn't matter)
-  - Total reaction time: ~90ms (vs ~200ms with NordVPN on Ashburn)
-  - Alternative: self-hosted WireGuard on NL VPS as proxy for Ashburn (~90-120ms)
+- User has **NordVPN** (Netherlands exit) — only needed on PC to create/access Polymarket account
+- **Bot VPS: Hetzner Falkenstein, Germany (~€4/mo)** — EU IP, no geo-block, direct Polymarket access
+  - Polymarket: direct from Germany, no VPN needed, ~10ms
+  - Kalshi: Germany → Ohio, ~100ms (acceptable, our gaps last seconds to minutes)
+- **NEVER access Polymarket account from a US IP** — would flag the account
 - **Kalshi is US-regulated, accessible from anywhere** — no VPN needed
+
+## Polymarket Account Setup (COMPLETE — 2026-03-28)
+- [x] MetaMask wallet connected to Polymarket (`0x4795e...` EOA, `0x6826c...` proxy)
+- [x] ~$95 USDC deposited and available to trade
+- [x] API credentials working (`019d323e...`)
+- [x] Bot placing real orders on both platforms
+- [ ] Deploy to Hetzner VPS (Monday)
 
 ## Next Steps
 1. **Set up Netherlands VPS** (Hetzner, ~€4/mo) — required because:

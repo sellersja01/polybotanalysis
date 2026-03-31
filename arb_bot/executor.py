@@ -12,7 +12,7 @@ import time
 import sqlite3
 from datetime import datetime, timezone
 
-from config import DRY_RUN, SHARES_PER_TRADE
+from config import DRY_RUN, SHARES_PER_TRADE, MAX_TRADES_PER_CANDLE, CANDLE_INTERVAL, TRADE_WINDOW
 
 
 class ExecutionResult:
@@ -49,6 +49,9 @@ class Executor:
         self.total_profit  = 0.0
         self.latencies     = []  # list of total_ms
 
+        # Per-candle trade counter: asset -> (candle_ts, trade_count)
+        self._candle_trades = {}
+
         # Trade log DB
         self._db = sqlite3.connect(db_path)
         self._db.execute("""CREATE TABLE IF NOT EXISTS trades (
@@ -66,6 +69,24 @@ class Executor:
         )""")
         self._db.commit()
 
+    def _candle_ts(self) -> int:
+        return (int(time.time()) // TRADE_WINDOW) * TRADE_WINDOW
+
+    def _check_candle_limit(self, symbol: str) -> bool:
+        """Returns True if we're allowed to trade this candle."""
+        candle_ts = self._candle_ts()
+        prev_ts, count = self._candle_trades.get(symbol, (0, 0))
+        if prev_ts != candle_ts:
+            # New candle — reset counter
+            self._candle_trades[symbol] = (candle_ts, 0)
+            count = 0
+        return count < MAX_TRADES_PER_CANDLE
+
+    def _increment_candle_count(self, symbol: str):
+        candle_ts = self._candle_ts()
+        _, count = self._candle_trades.get(symbol, (0, 0))
+        self._candle_trades[symbol] = (candle_ts, count + 1)
+
     async def execute(self, opp: dict) -> ExecutionResult:
         """
         Execute an arb opportunity.
@@ -74,26 +95,43 @@ class Executor:
         result = ExecutionResult()
         t_start = time.perf_counter_ns()
 
+        pair   = opp["pair"]
+        symbol = pair.get("symbol", "?")
+
+        # Check per-candle trade limit
+        if not self._check_candle_limit(symbol):
+            return result  # silently skip — already traded this candle
+
+        # ref_price_gap check disabled — re-enable once validated
+        # ref_gap = pair.get("ref_price_gap")
+        # if ref_gap is not None and ref_gap > 6.0:
+        #     return result
+
         # Time from detection to execution start
         detect_ts = opp.get("detect_ts", time.time())
         result.latency_detect_ms = (time.time() - detect_ts) * 1000
 
-        pair   = opp["pair"]
         shares = self.shares
         profit = opp["profit"] * shares
 
         self.total_fired += 1
+        self._increment_candle_count(symbol)
 
-        # Log the opportunity
-        ts_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        mode_str = "DRY" if self.dry_run else "LIVE"
-        print(
-            f"[{ts_str}] EXEC {pair['symbol']} {pair.get('timeframe','15m')} | "
-            f"{opp['poly_side']}@{opp['poly_ask']:.3f} + "
-            f"{opp['kalshi_side']}@{opp['kalshi_ask']:.3f} | "
-            f"net={opp['profit']*100:.2f}c ROI={opp['roi_pct']:.1f}% | "
-            f"detect={result.latency_detect_ms:.1f}ms | {mode_str}"
-        )
+        # Determine sides cleanly for display
+        poly_side_label   = "UP  " if "up"   in opp["poly_side"]   else "DOWN"
+        kalshi_side_label = "UP  " if "up"   in opp["kalshi_side"] else "DOWN"
+        mode_str = "DRY RUN" if self.dry_run else "LIVE"
+        ts_str   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+        print(f"\n{'='*55}", flush=True)
+        print(f"  *** TRADE FIRED — {symbol} 15m | {mode_str} ***", flush=True)
+        print(f"  Time       : {ts_str}", flush=True)
+        print(f"  Polymarket : {poly_side_label}  @ {opp['poly_ask']:.4f} (${opp['poly_ask']*shares:.2f})", flush=True)
+        print(f"  Kalshi     : {kalshi_side_label}  @ {opp['kalshi_ask']:.4f} (${opp['kalshi_ask']*shares:.2f})", flush=True)
+        print(f"  Total cost : ${(opp['poly_ask']+opp['kalshi_ask'])*shares:.2f}", flush=True)
+        print(f"  Net profit : {opp['profit']*100:.2f}¢  ROI={opp['roi_pct']:.1f}%", flush=True)
+        print(f"  Detect lag : {result.latency_detect_ms:.1f}ms", flush=True)
+        print(f"{'='*55}\n", flush=True)
 
         if self.dry_run:
             # Simulate execution latency
@@ -117,7 +155,8 @@ class Executor:
         else:
             k_side = "no" if k_yes_is_up else "yes"
 
-        k_price_cents = int(opp["kalshi_ask"] * 100)
+        # Add 10¢ buffer so limit order crosses the spread and fills immediately
+        k_price_cents = min(int(opp["kalshi_ask"] * 100) + 10, 99)
         is_maker = opp["kalshi_mode"] == "maker"
 
         async def fire_poly():
@@ -146,29 +185,52 @@ class Executor:
                 raise
 
         try:
-            poly_r, kalshi_r = await asyncio.gather(
-                fire_poly(), fire_kalshi(), return_exceptions=True
-            )
-
+            # Fire Polymarket first — must fully fill before Kalshi fires
+            poly_r = await fire_poly()
             if isinstance(poly_r, Exception):
                 result.error = f"poly: {poly_r}"
                 result.poly_result = str(poly_r)
-            else:
+                print(f"  POLY FAILED — skipping Kalshi to avoid unhedged position: {poly_r}")
+                result.latency_total_ms = (time.perf_counter_ns() - t_start) / 1e6
+                self.latencies.append(result.latency_total_ms)
+                self._log_trade(opp, result, pair)
+                return result
+
+            poly_resp = poly_r if isinstance(poly_r, dict) else {}
+            if not (poly_resp.get("success") or poly_resp.get("status") == "matched"):
+                result.error = f"poly not filled: {str(poly_r)[:100]}"
                 result.poly_result = str(poly_r)[:200]
+                print(f"  POLY NOT FILLED — skipping Kalshi: {result.error}")
+                result.latency_total_ms = (time.perf_counter_ns() - t_start) / 1e6
+                self.latencies.append(result.latency_total_ms)
+                self._log_trade(opp, result, pair)
+                return result
+
+            result.poly_result = str(poly_r)[:200]
+
+            # Match Kalshi to Poly fill — round to 1 decimal place
+            poly_filled = float(poly_resp.get("takingAmount", shares))
+            kalshi_shares = max(1, round(poly_filled))  # Kalshi API requires integer
+            if kalshi_shares != shares:
+                print(f"  Poly filled {poly_filled:.4f} shares — Kalshi buying {kalshi_shares}")
+
+            # Poly confirmed filled — now fire Kalshi with matched share count
+            t0 = time.perf_counter_ns()
+            kalshi_r = await self.kalshi.place_order(
+                pair["kalshi_ticker"], k_side, k_price_cents,
+                kalshi_shares, post_only=is_maker
+            )
+            result.latency_kalshi_ms = (time.perf_counter_ns() - t0) / 1e6
 
             if isinstance(kalshi_r, Exception):
-                result.error = (result.error or "") + f" kalshi: {kalshi_r}"
+                result.error = f"kalshi: {kalshi_r}"
                 result.kalshi_result = str(kalshi_r)
+                print(f"  KALSHI FAILED after poly filled — unhedged! {kalshi_r}")
             else:
                 result.kalshi_result = str(kalshi_r)[:200]
-
-            if not isinstance(poly_r, Exception) and not isinstance(kalshi_r, Exception):
                 result.success = True
                 self.total_success += 1
                 self.total_profit += profit
-            else:
-                # One leg failed — need to handle partial fill
-                print(f"  PARTIAL FILL: {result.error}")
 
         except Exception as e:
             result.error = str(e)

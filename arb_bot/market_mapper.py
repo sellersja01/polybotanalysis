@@ -1,174 +1,231 @@
 """
-market_mapper.py
-================
-Fetches open markets from both Polymarket and Kalshi, finds matching
-BTC/ETH/SOL/XRP 15m (and hourly/daily) candles, and saves the mapping.
-
-Run once at startup (or periodically) to refresh the map.
-
-Output: arb_bot/market_map.json
-[
-  {
-    "symbol":          "BTC",
-    "timeframe":       "15m",
-    "window_start_et": "2026-03-25 09:00",   // ET time
-    "poly_condition":  "0xabc...",
-    "poly_up_token":   "0xdef...",
-    "poly_down_token": "0x123...",
-    "kalshi_ticker":   "KXBTCU-26MAR25-1005",
-    "kalshi_yes_is":   "up",                  // 'yes' token = Up on this market
-  },
-  ...
-]
+market_mapper.py — Maps current Polymarket candles to Kalshi tickers
+=====================================================================
+Fetches the CURRENT open 15m candle for each asset from both platforms.
+Saves to market_map.json. Called at startup and every candle rollover.
 """
-
 import asyncio
 import json
-import re
+import time
 from datetime import datetime, timezone
 
+import aiohttp
+import websockets
+
+from config import KALSHI_SERIES, ASSETS, KALSHI_KEY_ID, KALSHI_KEY_PATH, POLY_GAMMA_URL
 from kalshi_client import KalshiClient
-from polymarket_client import PolymarketClient
 
-# ── Symbol config ──────────────────────────────────────────────────────────────
-SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
-
-POLY_KEYWORDS = {
-    "BTC": ["bitcoin", "btc"],
-    "ETH": ["ethereum", "eth"],
-    "SOL": ["solana", "sol"],
-    "XRP": ["xrp", "ripple"],
-}
-
-KALSHI_SERIES = {
-    "BTC": ["KXBTCU", "KXBTCD", "KXBTC"],
-    "ETH": ["KXETHU", "KXETHD", "KXETH"],
-    "SOL": ["KXSOLU", "KXSOLD", "KXSOL"],
-    "XRP": ["KXXRPU", "KXXRPD", "KXXRP"],
-}
-
-TIMEFRAMES = ["15m", "1h", "1d"]
+POLY_RTDS_URL = "wss://ws-live-data.polymarket.com"
 
 
-# ── Polymarket helpers ─────────────────────────────────────────────────────────
-def poly_detect_symbol(question: str) -> str | None:
-    q = question.lower()
-    for sym, kws in POLY_KEYWORDS.items():
-        if any(k in q for k in kws):
-            return sym
+async def fetch_poly_btc_price(candle_ts: int = None) -> float | None:
+    """
+    Fetch BTC/USD price from Polymarket's Chainlink RTDS feed.
+    If candle_ts is provided, finds the data point closest to that timestamp.
+    """
+    sub = {
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": json.dumps({"symbol": "btc/usd"})
+        }]
+    }
+    all_points = []
+    try:
+        async with websockets.connect(POLY_RTDS_URL, open_timeout=5) as ws:
+            await ws.send(json.dumps(sub))
+            for _ in range(5):
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                if not raw:
+                    continue
+                msg = json.loads(raw)
+                points = msg.get("payload", {}).get("data", [])
+                all_points.extend(points)
+                if all_points:
+                    break
+        if not all_points:
+            return None
+        # Find point closest to candle_ts if provided, else use most recent
+        if candle_ts:
+            target_ms = candle_ts * 1000
+            best = min(all_points, key=lambda p: abs(p["timestamp"] - target_ms))
+            return float(best["value"])
+        return float(all_points[-1]["value"])
+    except Exception as e:
+        print(f"[mapper] RTDS price fetch error: {e}", flush=True)
     return None
 
 
-def poly_detect_timeframe(question: str) -> str | None:
-    q = question.lower()
-    # "up or down" + time range like "9:00pm-9:15pm" → 15m
-    # look for "hour" keyword or single hour window
-    if re.search(r'\d+:\d+\s*(am|pm)[^\d]*-[^\d]*\d+:\d+\s*(am|pm)', q):
-        # find the two times and compute diff
-        times = re.findall(r'(\d+):(\d+)\s*(am|pm)', q)
-        if len(times) >= 2:
-            def to_min(h, m, ampm):
-                h = int(h) % 12 + (12 if ampm == 'pm' else 0)
-                return h * 60 + int(m)
-            t1 = to_min(*times[0])
-            t2 = to_min(*times[1])
-            diff = abs(t2 - t1)
-            if diff == 15:  return "15m"
-            if diff == 60:  return "1h"
-    if "daily" in q or "day" in q:
-        return "1d"
-    return None
+INTERVAL = 900  # 15 minutes
 
 
-# ── Kalshi helpers ─────────────────────────────────────────────────────────────
-def kalshi_detect_symbol(ticker: str) -> str | None:
-    t = ticker.upper()
-    for sym, prefixes in KALSHI_SERIES.items():
-        if any(t.startswith(p) for p in prefixes):
-            return sym
-    return None
+def current_candle_ts() -> int:
+    """Unix timestamp of the START of the current 15m candle."""
+    return (int(time.time()) // INTERVAL) * INTERVAL
 
 
-# ── Main mapper ────────────────────────────────────────────────────────────────
-async def build_map(key_id: str, key_path: str) -> list:
-    poly   = PolymarketClient()
-    kalshi = KalshiClient(key_id, key_path)
+async def fetch_poly_market(session: aiohttp.ClientSession, asset: str) -> dict | None:
+    """Fetch current 15m market for an asset from Polymarket Gamma API."""
+    slug_ts   = current_candle_ts()
+    slug      = f"{asset.lower()}-updown-15m-{slug_ts}"
+    url       = f"{POLY_GAMMA_URL}/events"
+    try:
+        async with session.get(url, params={"slug": slug}) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+        events = data if isinstance(data, list) else data.get("events", [])
+        if not events:
+            return None
+        event  = events[0]
+        markets = event.get("markets", [])
+        if not markets:
+            return None
+        m = markets[0]
 
-    print("Fetching Polymarket markets...")
-    poly_markets = []
-    cursor = ""
-    while True:
-        page = await poly.get_markets(cursor)
-        batch = page.get("data", [])
-        poly_markets.extend(batch)
-        cursor = page.get("next_cursor", "")
-        if not cursor or not batch:
-            break
-    print(f"  {len(poly_markets)} Polymarket markets fetched")
+        # Both fields are stored as JSON strings inside the JSON response
+        token_ids = json.loads(m.get("clobTokenIds", "[]"))
+        outcomes  = m.get("outcomes", "[]")
+        if isinstance(outcomes, str):
+            outcomes = json.loads(outcomes)
 
-    print("Fetching Kalshi markets...")
-    kalshi_markets = []
-    for sym, prefixes in KALSHI_SERIES.items():
-        for prefix in prefixes:
-            try:
-                batch = await kalshi.get_markets(series_ticker=prefix)
-                kalshi_markets.extend(batch)
-            except Exception:
-                pass
-    print(f"  {len(kalshi_markets)} Kalshi markets fetched")
+        if len(token_ids) < 2:
+            return None
 
-    # Index Kalshi by symbol
-    kalshi_by_sym = {sym: [] for sym in SYMBOLS}
-    for m in kalshi_markets:
-        sym = kalshi_detect_symbol(m.get("ticker", ""))
-        if sym:
-            kalshi_by_sym[sym].append(m)
+        # Determine which token index is Up vs Down
+        up_idx = next(
+            (i for i, o in enumerate(outcomes) if str(o).lower() == "up"), 0
+        )
+        dn_idx = 1 - up_idx
 
-    # Build map: for each Polymarket market find a Kalshi match
-    mapping = []
-    for pm in poly_markets:
-        q    = pm.get("question", "")
-        sym  = poly_detect_symbol(q)
-        tf   = poly_detect_timeframe(q)
-        if not sym or not tf:
-            continue
-        if "up or down" not in q.lower():
-            continue
+        # Extract the "price to beat" — Gamma stores it as startValue on the event
+        start_value = None
+        for field in ("startValue", "start_value", "openValue", "open_value"):
+            v = event.get(field)
+            if v is not None:
+                try:
+                    start_value = float(v)
+                except Exception:
+                    pass
+                break
 
-        tokens = pm.get("tokens", [])
-        up_tok   = next((t["token_id"] for t in tokens if t.get("outcome","").lower() == "up"),   None)
-        down_tok = next((t["token_id"] for t in tokens if t.get("outcome","").lower() == "down"), None)
-        if not up_tok or not down_tok:
-            continue
+        return {
+            "condition_id": m.get("conditionId") or m.get("condition_id"),
+            "up_token":     token_ids[up_idx],
+            "down_token":   token_ids[dn_idx],
+            "question":     event.get("title", ""),
+            "slug":         slug,
+            "price_to_beat": start_value,
+        }
+    except Exception as e:
+        print(f"[mapper] poly {asset} error: {e}", flush=True)
+        return None
 
-        # Find a Kalshi market with the same symbol + timeframe (loose match for now)
-        for km in kalshi_by_sym[sym]:
-            mapping.append({
-                "symbol":         sym,
-                "timeframe":      tf,
-                "poly_question":  q,
-                "poly_condition": pm.get("condition_id"),
-                "poly_up_token":  up_tok,
-                "poly_down_token": down_tok,
-                "poly_up_bid":    None,
-                "poly_up_ask":    None,
-                "kalshi_ticker":  km["ticker"],
-                "kalshi_yes_bid": None,
-                "kalshi_yes_ask": None,
-                "kalshi_yes_is":  "up",  # will be confirmed at runtime
+
+async def fetch_kalshi_ticker(kalshi: KalshiClient, asset: str,
+                              min_open_ts: float = None) -> dict | None:
+    """Fetch current open Kalshi ticker for an asset. Retries until new candle appears."""
+    series = KALSHI_SERIES[asset]
+    for _ in range(20):
+        try:
+            data = await kalshi.get("/markets", params={
+                "status": "open",
+                "series_ticker": series,
+                "limit": 1,
             })
-            break  # one Kalshi match per Poly market
+            markets = data.get("markets", [])
+            if not markets:
+                await asyncio.sleep(10)
+                continue
+            m = markets[0]
+            if min_open_ts:
+                ot_str = m.get("open_time", "")
+                try:
+                    ot = datetime.fromisoformat(
+                        ot_str.replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    ot = 0
+                if ot < min_open_ts:
+                    print(f"[mapper] waiting for new {asset} Kalshi market (got {m['ticker']})...",
+                          flush=True)
+                    await asyncio.sleep(10)
+                    continue
+            # Extract Kalshi target price — stored as floor_strike on the market
+            kalshi_target = None
+            for field in ("floor_strike", "cap_strike", "strike", "yes_sub_title"):
+                v = m.get(field)
+                if v is not None:
+                    try:
+                        kalshi_target = float(str(v).replace("$", "").replace(",", ""))
+                    except Exception:
+                        pass
+                    if kalshi_target:
+                        break
 
-    print(f"  {len(mapping)} matched pairs found")
-    with open("market_map.json", "w") as f:
-        json.dump(mapping, f, indent=2)
-    print("  Saved → market_map.json")
-    return mapping
+            return {
+                "ticker":        m["ticker"],
+                "yes_is":        "up",   # KXBTC15M yes = Up (BTC went up)
+                "target_price":  kalshi_target,
+            }
+        except Exception as e:
+            print(f"[mapper] kalshi {asset} error: {e}", flush=True)
+            await asyncio.sleep(5)
+    return None
 
 
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 3:
-        print("Usage: python market_mapper.py <kalshi_key_id> <kalshi_key_path>")
-        sys.exit(1)
-    asyncio.run(build_map(sys.argv[1], sys.argv[2]))
+async def build_map(session: aiohttp.ClientSession, kalshi: KalshiClient,
+                    min_open_ts: float = None, poly_ref_price: float = None) -> list:
+    """Build market map for the current candle. Returns list of pair dicts."""
+    pairs = []
+    candle_ts = current_candle_ts()
+
+    if poly_ref_price:
+        poly_btc_price = poly_ref_price
+        print(f"[mapper] Poly candle open (RTDS): ${poly_btc_price:,.2f}", flush=True)
+    else:
+        # Startup — RTDS only has current price, not candle open. Skip gap check.
+        poly_btc_price = None
+        print("[mapper] Startup — ref_gap check skipped (RTDS captures open price at rollover)", flush=True)
+
+    results = await asyncio.gather(
+        *[fetch_poly_market(session, asset) for asset in ASSETS],
+        *[fetch_kalshi_ticker(kalshi, asset, min_open_ts) for asset in ASSETS],
+        return_exceptions=True,
+    )
+
+    poly_results   = results[:len(ASSETS)]
+    kalshi_results = results[len(ASSETS):]
+
+    for i, asset in enumerate(ASSETS):
+        pm = poly_results[i]
+        km = kalshi_results[i]
+        if isinstance(pm, Exception) or isinstance(km, Exception):
+            print(f"[mapper] {asset} skipped (error)", flush=True)
+            continue
+        if not pm or not km:
+            print(f"[mapper] {asset} skipped (no market found)", flush=True)
+            continue
+        kalshi_ref = km.get("target_price")
+        ref_gap = abs(poly_btc_price - kalshi_ref) if poly_btc_price and kalshi_ref else None
+
+        pairs.append({
+            "symbol":           asset,
+            "timeframe":        "15m",
+            "candle_ts":        current_candle_ts(),
+            "poly_condition":   pm["condition_id"],
+            "poly_up_token":    pm["up_token"],
+            "poly_down_token":  pm["down_token"],
+            "kalshi_ticker":    km["ticker"],
+            "kalshi_yes_is":    km["yes_is"],
+            "poly_ref_price":   poly_btc_price,
+            "kalshi_ref_price": kalshi_ref,
+            "ref_price_gap":    ref_gap,
+        })
+        gap_str = f"${ref_gap:.2f}" if ref_gap is not None else "unknown"
+        print(f"[mapper] {asset}: poly={pm['condition_id'][:10]}... "
+              f"kalshi={km['ticker']} kalshi_target=${kalshi_ref:,.2f} ref_gap={gap_str}",
+              flush=True)
+
+    return pairs

@@ -19,8 +19,9 @@ def load_private_key(path: str):
 
 
 def sign_pss(private_key, method: str, path: str, ts_ms: int) -> str:
-    """RSA-PSS with SHA-256 — required by Kalshi."""
-    msg = f"{ts_ms}{method}{path}".encode()
+    """RSA-PSS with SHA-256 — required by Kalshi. Path must include /trade-api/v2 prefix."""
+    full_path = "/trade-api/v2" + path if not path.startswith("/trade-api") else path
+    msg = f"{ts_ms}{method}{full_path}".encode()
     sig = private_key.sign(
         msg,
         asym_padding.PSS(
@@ -78,7 +79,9 @@ class KalshiClient:
         async with s.post(KALSHI_API_URL + path,
                           headers=self._headers("POST", path),
                           json=body) as r:
-            r.raise_for_status()
+            if r.status >= 400:
+                text = await r.text()
+                raise RuntimeError(f"Kalshi {r.status} on POST {path}: {text[:500]}")
             return await r.json()
 
     async def get_markets(self, series_ticker: str = None, status: str = "open") -> list:
@@ -89,15 +92,13 @@ class KalshiClient:
         return data.get("markets", [])
 
     async def place_order(self, ticker: str, side: str, price_cents: int,
-                          count: int, post_only: bool = True) -> dict:
+                          count: float, post_only: bool = True) -> dict:
         body = {
-            "ticker":        ticker,
-            "side":          side,
-            "action":        "buy",
-            "count":         count,
-            "yes_price":     price_cents if side == "yes" else 100 - price_cents,
-            "time_in_force": "gtc" if post_only else "ioc",
-            "post_only":     post_only,
+            "ticker":    ticker,
+            "side":      side,
+            "action":    "buy",
+            "count":     int(round(float(count))),
+            "yes_price": price_cents if side == "yes" else 100 - price_cents,
         }
         return await self.post(self._order_path, body)
 
