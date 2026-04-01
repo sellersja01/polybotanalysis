@@ -25,8 +25,8 @@ from datetime import datetime
 LOOKBACK = 15
 MOVE_THRESH = 0.05
 DCA_INTERVAL = 10       # buy every 10 seconds
-BASE_SHARES = 10        # base shares per DCA buy
-MAX_ENTRIES = 20        # max total entries per candle (both sides combined)
+BASE_SHARES = 1         # base shares per DCA buy
+MAX_ENTRIES = 15        # max entries per direction (resets on flip)
 FLIP_THRESHOLD = 0.25   # if our side drops below this, consider flipping
 SELL_THRESHOLD = 0.20   # sell losing side when it drops below this
 RESOLUTION_THRESHOLD = 0.90  # pile in when a side hits this
@@ -69,8 +69,8 @@ async def get_btc_market():
 async def main():
     print("=" * 70)
     print("  GALINDRAST STRATEGY — Full Behavioral Replica")
-    print("  Buy both sides early → DCA winner → flip on reversal")
-    print("  → resolution scalp at 0.90+ → sell loser at 0.20")
+    print("  Buy both sides early -> DCA winner -> flip on reversal")
+    print("  -> resolution scalp at 0.90+ -> sell loser at 0.20")
     print(f"  DCA every {DCA_INTERVAL}s | Max {MAX_ENTRIES} entries | Base {BASE_SHARES}sh")
     print("=" * 70)
 
@@ -87,6 +87,8 @@ async def main():
     # Per-candle state
     primary_dir = None       # 'UP' or 'DOWN' — which side we're DCA-ing into
     initial_entered = False  # did we do the initial both-sides buy?
+    last_nonzero_up_mid = 0.0   # last known non-zero up mid (for resolution)
+    last_nonzero_dn_mid = 0.0   # last known non-zero dn mid (for resolution)
     up_entries = []          # list of {'shares', 'cost'}
     dn_entries = []
     up_sold = []             # list of {'shares', 'revenue'}
@@ -105,20 +107,31 @@ async def main():
     current_candle_ts = 0
 
     def up_mid():
-        return (poly_up_bid + poly_up_ask) / 2 if poly_up_bid and poly_up_ask else poly_up_ask
+        nonlocal last_nonzero_up_mid
+        m = (poly_up_bid + poly_up_ask) / 2 if poly_up_bid and poly_up_ask else poly_up_ask
+        if m > 0:
+            last_nonzero_up_mid = m
+        return m
 
     def dn_mid():
-        return (poly_dn_bid + poly_dn_ask) / 2 if poly_dn_bid and poly_dn_ask else poly_dn_ask
+        nonlocal last_nonzero_dn_mid
+        m = (poly_dn_bid + poly_dn_ask) / 2 if poly_dn_bid and poly_dn_ask else poly_dn_ask
+        if m > 0:
+            last_nonzero_dn_mid = m
+        return m
 
     async def resolve_candle():
         nonlocal total_pnl, primary_dir, initial_entered, up_entries, dn_entries
         nonlocal up_sold, dn_sold, last_dca_time, n_entries, flip_count
+        nonlocal last_nonzero_up_mid, last_nonzero_dn_mid
 
         if not up_entries and not dn_entries:
             return
 
-        um = up_mid()
-        dm = dn_mid()
+        # Use last known non-zero mids — winning side book goes empty at resolution
+        # so current mid=0 does NOT mean that side lost
+        um = last_nonzero_up_mid
+        dm = last_nonzero_dn_mid
         winner = 'UP' if um >= dm else 'DOWN'
         if um == 0 and dm == 0:
             winner = primary_dir or 'UP'
@@ -172,6 +185,8 @@ async def main():
         last_dca_time = 0.0
         n_entries = 0
         flip_count = 0
+        last_nonzero_up_mid = 0.0
+        last_nonzero_dn_mid = 0.0
 
     async def do_initial_entry():
         """Buy both sides at candle start — small exploratory position."""
@@ -215,7 +230,7 @@ async def main():
 
     async def check_flip(now):
         """Check if we should flip direction (our side collapsing)."""
-        nonlocal primary_dir, flip_count
+        nonlocal primary_dir, flip_count, n_entries
 
         if primary_dir is None:
             return
@@ -228,10 +243,19 @@ async def main():
             their_mid = up_mid()
 
         # If our side dropped below flip threshold AND other side is strong
+        # IMPORTANT: only flip if our ask is non-zero — ask=0 means empty book
+        # (no sellers left = our side is winning), NOT that our side collapsed
+        if primary_dir == 'UP':
+            our_ask = poly_up_ask
+        else:
+            our_ask = poly_dn_ask
+        if our_ask <= 0:
+            return  # empty book = winning side, don't flip
         if our_mid < FLIP_THRESHOLD and their_mid > 0.70 and flip_count < 3:
             old_dir = primary_dir
             primary_dir = 'DOWN' if primary_dir == 'UP' else 'UP'
             flip_count += 1
+            n_entries = 0  # reset so new direction gets its own entry budget
             ts = datetime.now().strftime("%H:%M:%S")
             print(
                 f"\n  !!! [{ts}] FLIP #{flip_count}: {old_dir} -> {primary_dir} | "
@@ -308,7 +332,7 @@ async def main():
 
         if ask <= 0 or ask > 0.99:
             return
-        if mid < 0.10:  # our side collapsed, don't buy
+        if mid < 0.10 and ask > 0:  # our side collapsed (but not empty book), don't buy
             return
 
         shares = get_shares(mid)
@@ -347,50 +371,55 @@ async def main():
                 ts = datetime.now().strftime("%H:%M:%S")
                 print(f"  [{ts}] RESOLUTION TRIGGER: Down at {dm:.3f} — setting dir=DOWN", flush=True)
 
-    async def binance_feed():
+    async def price_feed():
         nonlocal btc_price, btc_ticks
         while True:
             try:
                 async with websockets.connect(
-                    "wss://stream.binance.com:9443/ws/btcusdt@trade",
+                    "wss://advanced-trade-ws.coinbase.com",
                     ping_interval=20
                 ) as ws:
-                    print("[Binance] Connected", flush=True)
+                    await ws.send(json.dumps({
+                        "type": "subscribe",
+                        "product_ids": ["BTC-USD"],
+                        "channel": "ticker"
+                    }))
+                    print("[Coinbase] Connected", flush=True)
                     async for raw in ws:
                         msg = json.loads(raw)
-                        p = float(msg.get("p", 0))
-                        if p <= 0:
-                            continue
-                        btc_price = p
-                        now = time.time()
-                        btc_buffer.append((now, p))
-                        btc_ticks += 1
+                        for event in msg.get("events", []):
+                            for ticker in event.get("tickers", []):
+                                p = float(ticker.get("price", 0))
+                                if p <= 0:
+                                    continue
+                                btc_price = p
+                                now = time.time()
+                                btc_buffer.append((now, p))
+                                btc_ticks += 1
 
-                        cutoff = now - LOOKBACK
-                        old_p = None
-                        for ts, pr in btc_buffer:
-                            if ts <= cutoff:
-                                old_p = pr
-                            else:
-                                break
-                        if old_p and old_p > 0:
-                            move = (p - old_p) / old_p * 100
-                            if abs(move) >= MOVE_THRESH:
-                                await check_signal(move, p, now)
+                                cutoff = now - LOOKBACK
+                                old_p = None
+                                for ts, pr in btc_buffer:
+                                    if ts <= cutoff:
+                                        old_p = pr
+                                    else:
+                                        break
+                                if old_p and old_p > 0:
+                                    move = (p - old_p) / old_p * 100
+                                    if abs(move) >= MOVE_THRESH:
+                                        await check_signal(move, p, now)
 
-                        # Periodic checks every ~20 ticks
-                        if btc_ticks % 20 == 0:
-                            # Initial entry at candle start
-                            if not initial_entered and poly_up_ask > 0 and poly_dn_ask > 0:
-                                await do_initial_entry()
-
-                            await try_dca(now)
-                            await check_flip(now)
-                            await try_sell_loser(now)
-                            await try_resolution_scalp(now)
+                                # Periodic checks every ~20 ticks
+                                if btc_ticks % 20 == 0:
+                                    if not initial_entered and poly_up_ask > 0 and poly_dn_ask > 0:
+                                        await do_initial_entry()
+                                    await try_dca(now)
+                                    await check_flip(now)
+                                    await try_sell_loser(now)
+                                    await try_resolution_scalp(now)
 
             except Exception as e:
-                print(f"[Binance] Error: {e} -- reconnecting", flush=True)
+                print(f"[Coinbase] Error: {e} -- reconnecting", flush=True)
                 await asyncio.sleep(2)
 
     async def poly_feed():
@@ -452,6 +481,7 @@ async def main():
                                     poly_dn_ask = ba
                                 poly_ts = time.time()
                                 poly_ticks += 1
+                                up_mid(); dn_mid()  # keep last_nonzero values fresh
                                 continue
 
                             for ch in item.get("price_changes", []):
@@ -472,6 +502,7 @@ async def main():
                                         poly_dn_ask = price
                                 poly_ts = time.time()
                                 poly_ticks += 1
+                                up_mid(); dn_mid()  # keep last_nonzero values fresh
 
             except Exception as e:
                 print(f"[Poly] Error: {e} -- reconnecting", flush=True)
@@ -501,7 +532,7 @@ async def main():
     print("\nStarting Galindrast strategy...\n", flush=True)
     try:
         await asyncio.gather(
-            binance_feed(),
+            price_feed(),
             poly_feed(),
             status_printer(),
         )
