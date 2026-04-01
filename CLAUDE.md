@@ -24,13 +24,23 @@ Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays 
 ## Processes Running on VPS (all nohup)
 | Process | Log | Purpose |
 |---------|-----|---------|
-| `arb_collector.py` | `arb_collector.log` | **PRIMARY** — collects Polymarket + Kalshi prices simultaneously for BTC/ETH/SOL/XRP 15m |
+| `arb_collector.py` | `arb_collector.log` | Collects Polymarket + Kalshi prices for BTC/ETH/SOL/XRP 15m |
+| `paper_test_dca.py` | `paper_dca.log` | **PRIMARY** — Galindrast DCA paper trader (running overnight since 2026-03-31) |
+| `galindrast_collector.py` | `galindrast_collector.log` | Collects all live Galindrast trades to `galindrast_trades.db` |
 
 **All old processes (collector_v2, paper traders, wallet_collector) were killed on 2026-03-26 to clear the VPS for the arb collector.**
 
-**Restart arb collector after reboot:**
+**Restart commands after reboot:**
 ```bash
 nohup python3 -u /home/opc/arb_collector.py > /home/opc/arb_collector.log 2>&1 &
+nohup python3 -u /home/opc/paper_test_dca.py > /home/opc/paper_dca.log 2>&1 &
+nohup python3 -u /home/opc/galindrast_collector.py > /home/opc/galindrast_collector.log 2>&1 &
+```
+
+**Check overnight results:**
+```bash
+tail -50 /home/opc/paper_dca.log
+tail -20 /home/opc/galindrast_collector.log
 ```
 
 ## Databases on VPS (`/home/opc/`)
@@ -589,16 +599,33 @@ Every behavior below was directly observed in their trade data and replicated in
 
 7. **Hold to resolution** — All winning entries resolve at $1.00 at candle end. No early exits on the winning side. Observed: 96% of Galindrast's trades are buys (holds to resolution), only 4% sells (cutting losers).
 
-**Config:**
+**Config (as of 2026-03-31 overnight deployment):**
 ```python
 LOOKBACK = 15           # BTC move lookback (seconds)
 MOVE_THRESH = 0.05      # min BTC move % to trigger signal
 DCA_INTERVAL = 10       # buy every 10 seconds
-BASE_SHARES = 10        # base shares per buy (scales up to 100 at 0.95+)
-MAX_ENTRIES = 20        # max entries per candle (both sides combined)
+BASE_SHARES = 1         # base shares per buy — cut 10x from original to reduce swing size
+                        # Scales: mid<0.55->10sh, 0.55-0.70->20, 0.70-0.80->30,
+                        #         0.80-0.90->50, 0.90-0.95->80, 0.95+->100 (all x BASE_SHARES)
+MAX_ENTRIES = 15        # max entries PER DIRECTION (resets to 0 on flip)
 FLIP_THRESHOLD = 0.25   # flip direction when our side drops below this
 SELL_THRESHOLD = 0.20   # sell losing side when it drops below this
 RESOLUTION_THRESHOLD = 0.90  # pile in when a side hits this
+```
+
+**Price feed**: Uses **Coinbase Advanced Trade WebSocket** (`wss://advanced-trade-ws.coinbase.com`) instead of Binance — Oracle VPS is US IP (Ashburn), Binance.com blocks US IPs (HTTP 451). Coinbase works fine.
+
+**Bug fixes discovered during live paper testing (2026-03-31):**
+- **Empty book false flip**: When UP wins, order book empties (ask=0). `up_mid()` returned 0, triggering flip condition. Fixed: `if our_ask <= 0: return` guard in `check_flip()`.
+- **Wrong winner at resolution**: Winning side book empties first (ask=0, mid=0). Bot was declaring loser as winner. Fixed: track `last_nonzero_up_mid` / `last_nonzero_dn_mid` — updated on every price tick, used in `resolve_candle()` instead of current (possibly 0) mids.
+- **`n_entries` not resetting on flip**: `n_entries` was not in nonlocal declaration in `check_flip()`, so reset was silently ignored. Fixed: added to nonlocal and reset to 0 on every flip so new direction gets its own entry budget.
+- **last_nonzero values stale**: Were only updated during periodic Binance checks (every 20 ticks). Fixed: call `up_mid(); dn_mid()` on every Polymarket price update event.
+- **MAX_ENTRIES blocking post-flip buys**: After 20 entries (old value), flipping direction couldn't buy anything. Fixed: MAX_ENTRIES=15 per direction, resets to 0 on flip.
+
+**VPS deployment:**
+```bash
+# Already deployed and running since 2026-03-31 night
+tail -50 /home/opc/paper_dca.log   # check results
 ```
 
 **Why each behavior matters:**
@@ -641,21 +668,13 @@ RESOLUTION_THRESHOLD = 0.90  # pile in when a side hits this
 - [ ] Deploy to Hetzner VPS (Monday)
 
 ## Next Steps
-1. **Set up Hetzner VPS in Germany/Netherlands** (~€4/mo) — required because:
-   - Binance.com blocks US IPs (Oracle VPS in Ashburn gets HTTP 451)
+1. **Review overnight paper_test_dca.py results** — check `/home/opc/paper_dca.log` for candle-by-candle PnL. Need 200+ candles to validate 71% WR holds live.
+2. **Set up Hetzner VPS in Germany/Netherlands** (~€4/mo) — required for live trading because:
    - Polymarket blocks US IPs (needs non-US IP)
-   - EU VPS solves both: Binance accessible, Polymarket accessible, no VPN needed
-2. **Build production bot** combining both strategies:
-   - **Latency arb**: Single-entry on BTC signal, exit on Poly reprice (fast, high frequency)
-   - **DCA + resolution scalp (Galindrast-style)**: Enter both sides, DCA throughout, scale into winner at 0.90+
-   - Both strategies are profitable independently — can run both or pick one
-3. **Wire up Polymarket order execution:**
-   - Already working from cross-platform arb work (proxy wallet `0x6826c...`, ~$95 USDC)
-   - `MarketOrderArgs` + `FAK` order type confirmed working
-   - `signature_type=2` + `funder=0x6826c...` required
-4. **Deploy bot on Hetzner VPS** in DRY_RUN mode — verify latency and live signals
-5. **Go live small** — $1-5/trade, scale gradually on evidence
-6. **Add ETH 5m support** — Galindrast trades 31% ETH, backtest shows more signals than BTC
-7. **Keep galindrast_collector running on Oracle VPS** — track their evolving strategy
-8. **Keep arb_collector running on Oracle VPS** — cross-platform data for backup strategy
-9. **Paper trade DCA strategy for 1+ week** — need 200+ candles to validate 71% WR holds live
+   - EU VPS: Polymarket accessible, Binance accessible, no VPN needed
+   - Oracle VPS (US IP) can only run paper DCA (uses Coinbase feed, no Poly trading from US IP)
+3. **Build expensive-side momentum bot** — enter when Poly ask >= 0.80 on either side, hold to settlement. Backtest: 84-88% WR, ~$5/trade at $100. Keep separate from other bots.
+4. **Go live small on DCA strategy** — $1-5/trade once 200+ candle paper history confirms WR
+5. **Keep galindrast_collector running on Oracle VPS** — track their evolving strategy
+6. **Keep arb_collector running on Oracle VPS** — cross-platform data for backup strategy
+7. **Cross-platform arb (on pause)** — revisit when latency arb slows down
