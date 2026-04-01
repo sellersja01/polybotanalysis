@@ -3,7 +3,11 @@
     "allow": [
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:coinsbench.com)",
-      "WebFetch(domain:www.trevorlasn.com)"
+      "WebFetch(domain:www.trevorlasn.com)",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "WebFetch(domain:clob.polymarket.com)",
+      "WebFetch(domain:polymarket.com)",
+      "WebFetch(domain:ares.pro)"
     ]
   }
 }

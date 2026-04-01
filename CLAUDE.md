@@ -421,6 +421,99 @@ EXIT_TIMEOUT = 60    # close after 60s if no 2c reprice
 
 ---
 
+## Galindrast Wallet Analysis (2026-03-31)
+
+### Profile
+- **Wallet**: `0xeebde7a0e019a63e6b476eb425505b7b3e6eba30`
+- **Username**: Galindrast (pseudonym: Popular-Insurrection)
+- **Joined**: March 25, 2026 (6 days before analysis)
+- **$1,500 → $128,000** in 6 days = **85x return**
+- **4,485 trades** | $14M volume | **+$133k net PnL**
+- **Markets**: BTC 5m (67%), ETH 5m (31%), BTC hourly + 4h (2%)
+- **Collector running on Oracle VPS**: `galindrast_collector.py` → `/home/opc/galindrast_trades.db`
+
+### Strategy Breakdown (from 24,604 trades over 8.7 hours)
+
+**Phase 1 — Initial Entry (0-15 seconds):**
+- Enters BOTH sides within 5-11 seconds of candle start
+- 94% of first trades happen in the first 30 seconds
+- First trade avg price: 0.51 (near 50/50 — before knowing direction)
+- Small size: avg 35 shares, ~$17 per side
+
+**Phase 2 — DCA Throughout (15-250 seconds):**
+- Buys BOTH sides throughout the entire candle
+- 97% of candles have direction switches (buying both Up and Down)
+- 63% of trades happen in the SAME SECOND (burst execution)
+- 86% of trades within 5 seconds of previous trade
+- 2,149 bursts of 3+ trades in 3 seconds detected
+
+**Phase 3 — Resolution Scalp (when one side hits 0.90+):**
+- Deploys **10x more capital** at 0.90-1.00 (avg 195 shares vs 22 at other levels)
+- 512,529 shares at 0.90-1.00 = **$505k** (69% of total volume)
+- This is where the profit comes from: buy at $0.95, resolve at $1.00 = $0.05/share × thousands
+
+**Phase 4 — Cut Losses (late candle):**
+- 3.7% of trades are SELLS at avg price 0.17
+- Sells happen avg 207 seconds into candle (late)
+- Dumping the losing side before resolution to recover some capital
+
+### Key Metrics
+| Metric | Value |
+|--------|-------|
+| Trades/candle | 99.6 avg (86 median) |
+| USDC/candle | $2,960 avg ($1,261 median) |
+| Bought both sides | 96% of candles |
+| Share ratio (primary/secondary) | 3.6x avg, 2.5x median |
+| Direction switches mid-candle | 97% of candles |
+| Candles where BOTH sides bought above 0.70 | 48/160 (30%) — reversals |
+
+### How Reversals Are Handled
+- 30% of candles have a full reversal (one side goes to 0.80+ then crashes)
+- When reversal happens, bot **flips to the new winning side** and starts resolution scalping that side
+- Accepts the loss on the first direction, tries to make it back on the reversal
+- Does NOT stop buying — just switches which side it's scaling into
+
+### Profitability Math
+- Early both-sides buying: ~$80 per candle (small, informational)
+- Resolution scalp (winner at 0.95): ~$950 deployed → $1,000 payout = **$50 profit**
+- Losing side: $40 cost - $13.60 sold at 0.17 = **-$26.40 loss**
+- Net per candle: ~$23.60 (but varies widely)
+- Slippage at their scale ($10k+/candle) eats ~1-2%, reducing PnL/volume from ~2.9% (backtest) to ~0.96% (actual)
+
+### DCA Backtest Results (our data, 184 hours, BTC 5m)
+Simulated Galindrast-style: BTC signal → DCA every 15s → scale up at high confidence → hold to resolution.
+
+| Metric | Value |
+|--------|-------|
+| Candles with signal | 790 |
+| Win rate | 71.0% |
+| Avg win | +$60.24 |
+| Avg loss | -$111.73 |
+| Avg PnL/candle | +$10.39 |
+| Daily PnL (base) | $1,070/day |
+| Daily PnL (30x scale) | $32,095/day |
+
+### Live Paper Test (3 candles, 15 minutes, 2026-03-31)
+| Candle | Dir | Entries | Cost | Payout | PnL | ROI |
+|--------|-----|---------|------|--------|-----|-----|
+| #1 | UP | 11 | $528 | $560 | +$31.69 | 6.0% |
+| #2 | UP | 14 | $121 | $200 | +$78.53 | 64.7% |
+| #3 | DOWN | 14 | $305 | $370 | +$64.71 | 21.2% |
+| **Total** | | | **$955** | **$1,130** | **+$174.93** | **18.3%** |
+
+### Files
+| File | Purpose |
+|------|---------|
+| `galindrast_collector.py` | Live trade collector (running on Oracle VPS) |
+| `galindrast_deep_analysis.py` | Full behavioral analysis (timing, sizing, direction) |
+| `resolution_scalp_backtest.py` | Resolution scalp backtest by threshold |
+| `resolution_scalp_v2.py` | Galindrast-style entry + scaling backtest |
+| `resolution_scalp_v3.py` | DCA throughout candle backtest |
+| `arb_bot/paper_test_dca.py` | Live paper test — DCA to resolution |
+| `databases/galindrast_trades.db` | Local copy of collected trades (24k+) |
+
+---
+
 ## Backtesting Rules (for any future backtests)
 - **100% of candles** — never filter to decisive only
 - **Winner = highest mid at last observed tick** (not >= 0.85 threshold)
@@ -447,16 +540,21 @@ EXIT_TIMEOUT = 60    # close after 60s if no 2c reprice
 - [ ] Deploy to Hetzner VPS (Monday)
 
 ## Next Steps
-1. **Set up Netherlands VPS** (Hetzner, ~€4/mo) — required because:
+1. **Set up Hetzner VPS in Germany/Netherlands** (~€4/mo) — required because:
    - Binance.com blocks US IPs (Oracle VPS in Ashburn gets HTTP 451)
    - Polymarket blocks US IPs (needs non-US IP)
-   - NL VPS solves both: Binance accessible, Polymarket accessible, no VPN needed
-2. **Wire up Polymarket account:**
-   - Need EIP-712 wallet signing for CLOB orders (placeholder in `polymarket_client.py`)
-   - Fund with USDC on Polygon network
-3. **Deploy latency bot on NL VPS** in DRY_RUN mode — verify latency and live signals
-4. **Go live small** — $1-5/trade, scale gradually on evidence
-5. **Add multi-asset support** — ETH 5m showed even more signals than BTC in backtest
-6. **Keep cross-platform arb as backup** — secondary income stream + fallback when latency arb edge compresses
-7. **Keep arb_collector running on Oracle VPS** — continuous data collection
-8. **Download wallet_trades.db** — gzip likely done on VPS, grab it next session
+   - EU VPS solves both: Binance accessible, Polymarket accessible, no VPN needed
+2. **Build production bot** combining both strategies:
+   - **Latency arb**: Single-entry on BTC signal, exit on Poly reprice (fast, high frequency)
+   - **DCA + resolution scalp (Galindrast-style)**: Enter both sides, DCA throughout, scale into winner at 0.90+
+   - Both strategies are profitable independently — can run both or pick one
+3. **Wire up Polymarket order execution:**
+   - Already working from cross-platform arb work (proxy wallet `0x6826c...`, ~$95 USDC)
+   - `MarketOrderArgs` + `FAK` order type confirmed working
+   - `signature_type=2` + `funder=0x6826c...` required
+4. **Deploy bot on Hetzner VPS** in DRY_RUN mode — verify latency and live signals
+5. **Go live small** — $1-5/trade, scale gradually on evidence
+6. **Add ETH 5m support** — Galindrast trades 31% ETH, backtest shows more signals than BTC
+7. **Keep galindrast_collector running on Oracle VPS** — track their evolving strategy
+8. **Keep arb_collector running on Oracle VPS** — cross-platform data for backup strategy
+9. **Paper trade DCA strategy for 1+ week** — need 200+ candles to validate 71% WR holds live
