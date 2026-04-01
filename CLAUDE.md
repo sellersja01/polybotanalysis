@@ -558,8 +558,60 @@ Simulated Galindrast-style: BTC signal → DCA every 15s → scale up at high co
 | `resolution_scalp_backtest.py` | Resolution scalp backtest by threshold |
 | `resolution_scalp_v2.py` | Galindrast-style entry + scaling backtest |
 | `resolution_scalp_v3.py` | DCA throughout candle backtest |
-| `arb_bot/paper_test_dca.py` | Live paper test — DCA to resolution |
+| `arb_bot/paper_test_dca.py` | **Full Galindrast replica** — all 7 behaviors below |
 | `databases/galindrast_trades.db` | Local copy of collected trades (24k+) |
+
+### Paper Test: Galindrast Strategy Replica (`paper_test_dca.py`)
+
+Built from reverse-engineering 24,604 trades across 8.7 hours of Galindrast's actual behavior.
+Every behavior below was directly observed in their trade data and replicated in the bot.
+
+**7 core behaviors (all implemented):**
+
+1. **Initial both-sides entry (0-10s)** — Buy BASE_SHARES of both Up and Down immediately at candle start. Small exploratory position (~$17 per side). Observed: 94% of Galindrast's first trades happen within 30s at avg price 0.51.
+
+2. **BTC signal locks direction** — When Binance BTC moves >= 0.05% in 15s, lock `primary_dir` to Up or Down. All subsequent DCA buys go to this side. Observed: Galindrast has a directional tilt on 64% of candles (UP_heavy or DN_heavy).
+
+3. **DCA with confidence scaling** — Buy every 10 seconds, scaling shares based on poly mid:
+   - mid < 0.55: 10 shares (exploratory)
+   - mid 0.55-0.70: 20 shares
+   - mid 0.70-0.80: 30 shares
+   - mid 0.80-0.90: 50 shares
+   - mid 0.90-0.95: 80 shares (resolution scalp)
+   - mid 0.95+: 100 shares (near-certain, pile in)
+   Observed: Galindrast deploys 10x more capital at 0.90+ (avg 195sh vs 22sh at other levels). 69% of their volume is at 0.90-1.00.
+
+4. **Flip on reversal** — If our side drops below 0.25 AND the other side is above 0.70, FLIP `primary_dir` to the other side. Max 3 flips per candle. Observed: 30% of Galindrast's candles had both sides bought above 0.70 (full reversals). They don't stop buying — they switch sides and start resolution scalping the new winner.
+
+5. **Sell losers** — When losing side drops below 0.20, sell remaining shares at bid to recover capital. Observed: 3.7% of Galindrast's trades are sells at avg price 0.17, happening avg 207s into candle.
+
+6. **Resolution scalp trigger** — If either side hits 0.90+ even without a BTC signal, set direction and start buying big. This catches candles where BTC is flat but Poly odds drift. Observed: Galindrast trades candles with no clear BTC signal too.
+
+7. **Hold to resolution** — All winning entries resolve at $1.00 at candle end. No early exits on the winning side. Observed: 96% of Galindrast's trades are buys (holds to resolution), only 4% sells (cutting losers).
+
+**Config:**
+```python
+LOOKBACK = 15           # BTC move lookback (seconds)
+MOVE_THRESH = 0.05      # min BTC move % to trigger signal
+DCA_INTERVAL = 10       # buy every 10 seconds
+BASE_SHARES = 10        # base shares per buy (scales up to 100 at 0.95+)
+MAX_ENTRIES = 20        # max entries per candle (both sides combined)
+FLIP_THRESHOLD = 0.25   # flip direction when our side drops below this
+SELL_THRESHOLD = 0.20   # sell losing side when it drops below this
+RESOLUTION_THRESHOLD = 0.90  # pile in when a side hits this
+```
+
+**Why each behavior matters:**
+- Initial both-sides: ensures you have a position in whichever side wins, even before BTC signal
+- BTC signal: gives directional edge (71% WR in backtest)
+- Confidence scaling: small risk early, massive size when near-certain — matches Galindrast's 10x at 0.90+
+- Flip on reversal: prevents catastrophic losses when candle reverses (happens 30% of the time)
+- Sell losers: recovers $13.60 per $40 lost position instead of holding to $0
+- Resolution scalp: the main profit driver — $0.05/share × 1000+ shares at 0.95
+- Hold to resolution: no early exits means capturing full $1.00 payout
+
+**Paper test results (3 candles, 15 min, pre-flip version):**
+3/3 wins, +$174.93, 18.3% ROI. Full version with flip/sell not yet tested over large sample.
 
 ---
 
