@@ -385,25 +385,54 @@ Above 0.60 adds no trades but increases max loss. Big losses (-$64 live) come fr
 - **Cannot run on Oracle VPS** — Binance.com blocks US IPs (HTTP 451)
 - Binance.us works but has almost no volume (3 ticks/20s vs 6,000/min on .com)
 
-### Latency Bot Files (built 2026-03-30)
+### Latency Bot Files (built 2026-03-30, updated 2026-03-30 evening)
 | File | Purpose |
 |------|---------|
-| `arb_bot/binance_feed.py` | Real-time BTC price from Binance WS, rolling buffer, move detection |
-| `arb_bot/latency_detector.py` | Compares Binance moves vs Poly odds, fires signal when stale |
-| `arb_bot/latency_bot.py` | Main bot — wires feeds + detector + executor, DRY_RUN, SQLite logging |
-| `arb_bot/paper_test.py` | Self-contained paper trading test (no auth needed) |
+| `arb_bot/paper_test.py` | **PRIMARY** — multi-asset live/paper bot (BTC+ETH 5m simultaneously) |
+| `arb_bot/polymarket_client.py` | Polymarket CLOB client — place_order + sell_order |
+| `arb_bot/test_sell.py` | Buy->sell cycle test (confirms 4s settlement wait works) |
+| `backtest_cheapside.py` | Backtest of cheap-side + expensive-side wallet strategy |
 | `latency_lag_v2.py` | Fast backtest — loads all data into memory |
 | `latency_lag_honest.py` | Honest backtest — enters on every signal, no cherry-picking |
-| `latency_lag_all.py` | Multi-market backtest (BTC/ETH/SOL/XRP × 5m/15m) |
+| `latency_lag_all.py` | Multi-market backtest (BTC/ETH/SOL/XRP x 5m/15m) |
+
+### paper_test.py — Current Architecture (2026-03-30 evening)
+- **Multi-asset**: BTC 5m + ETH 5m run in parallel — separate Binance + Poly WS feeds per asset
+- **Per-asset state dicts** — no shared mutable variables between assets
+- **Entry trigger**: Binance move >= MOVE_THRESH AND Poly mid < 0.55 (stale)
+- **Exit**: sell after 4s minimum hold, when profit >= 2c/share OR age >= 60s
+- **Real P&L**: tracks `usdc_spent` (makingAmount) and `usdc_received` (sell takingAmount)
+- **ETH price fix**: book snapshots with empty bids/asks no longer overwrite prices to 0
+- **Status line**: shows current 15s move% per asset so you can see how close to threshold
 
 ### Paper Test Config (`paper_test.py`)
 ```python
-LOOKBACK = 15        # BTC move lookback (seconds)
-MOVE_THRESH = 0.05   # min BTC move % to trigger
-COOLDOWN = 2         # seconds between trades
-MAX_ENTRY_PRICE = 0.80  # don't buy above this
-MAX_OPEN = 5         # max simultaneous open trades
-EXIT_TIMEOUT = 60    # close after 60s if no 2c reprice
+LOOKBACK            = 15     # price lookback window (seconds)
+MOVE_THRESH         = 0.07   # min move % to trigger (env: MOVE_THRESH)
+COOLDOWN            = 2      # seconds between trades per asset
+MIN_ENTRY_PRICE     = 0.25
+MAX_ENTRY_PRICE     = 0.75
+MAX_TRADES_PER_CANDLE = 10
+MAX_OPEN            = 5      # across all assets
+TRADE_USD           = 1.0    # USDC per live trade (env: TRADE_USD)
+```
+
+### MOVE_THRESH History
+- **0.05%** — original, caused noisy losing trades (too sensitive, fires on random wiggles)
+- **0.15%** — raised to filter noise, but too strict for calm markets (0 entries for hours)
+- **0.07%** — current default, middle ground
+
+### Run commands
+```powershell
+# Paper mode
+python arb_bot/paper_test.py
+
+# Live mode (always clear old env vars first)
+Remove-Item Env:MOVE_THRESH -ErrorAction SilentlyContinue
+$env:DRY_RUN="false"; python arb_bot/paper_test.py
+
+# Custom threshold
+$env:MOVE_THRESH="0.05"; $env:DRY_RUN="false"; python arb_bot/paper_test.py
 ```
 
 ### Risk: Edge Compression
@@ -418,6 +447,26 @@ EXIT_TIMEOUT = 60    # close after 60s if no 2c reprice
 - Total drawdown kill switch: **-40%**
 - Position sizing: **Kelly Criterion**
 - Paper trade for **minimum 1 week** (200+ trades) before going live
+
+---
+
+## Wallet Analysis (2026-03-30 evening)
+
+Analyzed an unknown wallet trading both sides of each candle. Key findings:
+
+**Pattern**: buys cheap side (small position) + expensive side (large position) in same candle
+- Cheap side entries: 14-47c | Expensive side: 52-96c | 10-20x more capital on expensive side
+- Net profitable on observed trades (~+$354 across 11 positions)
+
+**Backtest of this strategy** (`backtest_cheapside.py`, 109-93 hours of data):
+
+| Strategy | BTC 5m WR | ETH 5m WR | Avg $/trade |
+|----------|-----------|-----------|-------------|
+| Cheap side <= 20c | 8.2% | 11.0% | -$41 to -$56 |
+| Expensive side >= 80c | **88.2%** | **87.1%** | **+$5 to +$6** |
+| Combined | 9% net positive | 12% net positive | deeply negative |
+
+**Conclusion**: The cheap side is a lottery ticket — deeply losing over time. The expensive side (>=80c) is profitable at 84-88% WR with ~$5/trade. The wallet's edge comes from the expensive-side momentum bet, not the cheap-side contrarian.
 
 ---
 
