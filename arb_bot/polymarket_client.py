@@ -73,6 +73,27 @@ class PolymarketClient:
             r.raise_for_status()
             return await r.json()
 
+    async def sell_order(self, token_id: str, shares: float) -> dict:
+        """Sell shares back to AMM at market price."""
+        if not self._clob:
+            raise RuntimeError("CLOB client not initialized")
+        try:
+            from py_clob_client.clob_types import MarketOrderArgs
+            # Use 98% of shares — fees are deducted from received shares so
+            # actual balance is slightly less than takingAmount
+            safe_shares = round(float(shares) * 0.98, 6)
+            args = MarketOrderArgs(
+                token_id=token_id,
+                amount=safe_shares,
+                side="SELL",
+                price=0.01,  # will sweep down to 1¢ — guaranteed fill
+            )
+            signed = await asyncio.to_thread(self._clob.create_market_order, args)
+            resp   = await asyncio.to_thread(self._clob.post_order, signed, "FAK")
+            return resp
+        except Exception as e:
+            raise RuntimeError(f"Sell failed: {e}")
+
     async def place_order(self, token_id: str, price: float, size: int,
                           side: str = "BUY") -> dict:
         """
@@ -92,6 +113,7 @@ class PolymarketClient:
                 token_id=token_id,
                 amount=amount,
                 side="BUY",
+                price=0.99,  # market order — willing to pay up to $0.99/share
             )
             signed = await asyncio.to_thread(self._clob.create_market_order, args)
             resp   = await asyncio.to_thread(self._clob.post_order, signed, "FAK")
