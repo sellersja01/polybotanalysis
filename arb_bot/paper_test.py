@@ -28,7 +28,7 @@ LOOKBACK            = 15
 COOLDOWN            = 2
 MIN_ENTRY_PRICE     = 0.25
 MAX_ENTRY_PRICE     = 0.75
-MAX_TRADES_PER_CANDLE = 10
+MAX_TRADES_PER_CANDLE = 2
 MAX_OPEN            = 5   # across all assets
 
 # ── Asset definitions ────────────────────────────────────────────────────────

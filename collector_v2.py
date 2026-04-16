@@ -208,11 +208,10 @@ async def manage_market(asset, tf_key):
         await asyncio.sleep(1)
 
 async def watchdog():
-    """Restart process if no data written to any DB in the last 2 minutes."""
-    STALE_THRESHOLD = 120  # seconds
-    await asyncio.sleep(60)  # give it 60s to start up first
+    """Just log if data is stale — don't kill the process."""
+    await asyncio.sleep(60)
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
         now = time.time()
         most_recent = 0
         for asset, tf in MARKETS:
@@ -226,9 +225,8 @@ async def watchdog():
                 pass
         if most_recent > 0:
             age = now - most_recent
-            if age > STALE_THRESHOLD:
-                print(f"[WATCHDOG] No data for {age:.0f}s — forcing restart")
-                os._exit(1)
+            if age > 120:
+                print(f"[WATCHDOG] Warning: no data for {age:.0f}s — feeds may be disconnected")
 
 
 async def main():

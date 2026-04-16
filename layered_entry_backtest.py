@@ -19,8 +19,13 @@ DBS = {
     'BTC_15m': r'C:\Users\James\polybotanalysis\market_btc_15m.db',
     'ETH_5m':  r'C:\Users\James\polybotanalysis\market_eth_5m.db',
     'ETH_15m': r'C:\Users\James\polybotanalysis\market_eth_15m.db',
+    'SOL_5m':  r'C:\Users\James\polybotanalysis\market_sol_5m.db',
+    'SOL_15m': r'C:\Users\James\polybotanalysis\market_sol_15m.db',
+    'XRP_5m':  r'C:\Users\James\polybotanalysis\market_xrp_5m.db',
+    'XRP_15m': r'C:\Users\James\polybotanalysis\market_xrp_15m.db',
 }
-INTERVALS = {'BTC_5m': 300, 'ETH_5m': 300, 'BTC_15m': 900, 'ETH_15m': 900}
+INTERVALS = {'BTC_5m': 300, 'ETH_5m': 300, 'BTC_15m': 900, 'ETH_15m': 900,
+             'SOL_5m': 300, 'SOL_15m': 900, 'XRP_5m': 300, 'XRP_15m': 900}
 
 SHARES_PER_LEVEL = 100
 EXIT_MID = 0.20
@@ -28,7 +33,7 @@ FEE_RATE = 0.25
 FEE_EXP  = 2
 
 def fee(shares, price):
-    return shares * price * FEE_RATE * (price * (1 - price)) ** FEE_EXP
+    return shares * price * 0.072 * (price * (1 - price)) ** 1  # post-Mar30 formula
 
 def run(label, db_path, entry_levels):
     interval = INTERVALS[label]
@@ -54,9 +59,12 @@ def run(label, db_path, entry_levels):
         if not up_ticks or not dn_ticks:
             continue
 
-        # Winner = whoever has higher mid at last observed tick (100% of candles)
-        final_mid = up_ticks[-1][2]
-        winner = 'Up' if final_mid >= 0.5 else 'Down'
+        # Winner = whoever has higher mid at last observed tick
+        final_up_mid = up_ticks[-1][2]
+        final_dn_mid = dn_ticks[-1][2]
+        winner_mid = max(final_up_mid, final_dn_mid)
+        winner = 'Up' if final_up_mid >= final_dn_mid else 'Down'
+
 
         all_ticks = sorted(
             [(ts, 'Up',   ask, mid) for ts, ask, mid in up_ticks] +
@@ -93,7 +101,8 @@ def run(label, db_path, entry_levels):
                 dn_exit_bid = max(0.0, 2 * mid - ask)
 
         if not up_entries or not dn_entries:
-            continue  # never triggered any level
+            results.append({'pnl': 0.0, 'cost': 0.0, 'win': False, 'levels': 0})
+            continue  # never triggered — counts as $0 candle
 
         total_levels_entered += len(levels_triggered)
         n_entries = len(up_entries)  # same as len(dn_entries)
@@ -157,7 +166,7 @@ CONFIGS = [
     ('All 5 levels',         [0.45, 0.40, 0.35, 0.30, 0.25]),
 ]
 
-MARKETS = ['BTC_5m', 'BTC_15m', 'ETH_5m', 'ETH_15m']
+MARKETS = ['BTC_5m', 'BTC_15m', 'ETH_5m', 'ETH_15m', 'SOL_5m', 'SOL_15m', 'XRP_5m', 'XRP_15m']
 
 print(f"\n{'='*100}")
 print(f"  LAYERED ENTRY BACKTEST  (100% of candles, winner = highest mid at last tick, real fees)")

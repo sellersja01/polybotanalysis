@@ -1,0 +1,105 @@
+======================================================================
+  WALLET: BOSHBASHBISH
+  Address: 0x29bc82f761749e67fa00d62896bc6855097b683c
+======================================================================
+
+── STRATEGY CLASSIFICATION ─────────────────────────────────────────
+  * BOTH-SIDES BUYER: buys Up AND Down in >70% of candles
+  * BURST TRADER: 267 bursts of 3+ trades in 3s (likely bot)
+
+── BASIC STATS ─────────────────────────────────────────────────────
+  Total trades:      3,463
+  BUY trades:        3,127  (90.3%)
+  SELL trades:       288  (8.3%)
+  Total USDC bought: $47,283.12
+  Total USDC sold:   $4,517.57
+  Date range:        2026-03-24 11:27:59  ->  2026-03-25 01:02:57
+
+── ESTIMATED WIN RATE ──────────────────────────────────────────────
+  Candles analyzed:  31
+  Wins:              19  (61.3%)
+  Losses:            12  (38.7%)
+  Est. Win Rate:     61.3%
+
+── ASSETS TRADED ───────────────────────────────────────────────────
+  BTC        2,014 trades  (64.4%)
+  ETH        1,113 trades  (35.6%)
+
+── TIMEFRAMES ──────────────────────────────────────────────────────
+  5m           2,467 trades  (78.9%)
+  15m            660 trades  (21.1%)
+
+── ENTRY PRICE DISTRIBUTION (buys only) ────────────────────────────
+       Range    # trades   % trades          USDC     % vol
+  ----------  ----------  ---------  ------------  --------
+        0-10         127       4.1%  $     298.00      0.6%  #####
+       10-20         380      12.2%  $   1,794.30      3.8%  ###############
+       20-30         344      11.0%  $   2,520.05      5.3%  ##############
+       30-40         720      23.0%  $   8,196.36     17.3%  ##############################
+       40-50         633      20.2%  $  12,033.94     25.5%  ##########################
+       50-60         569      18.2%  $  10,467.34     22.1%  #######################
+       60-70         221       7.1%  $   5,923.08     12.5%  #########
+       70-80         118       3.8%  $   5,574.56     11.8%  ####
+       80-90          15       0.5%  $     475.49      1.0%  
+       90-95           0       0.0%  $       0.00      0.0%  
+      95-100           0       0.0%  $       0.00      0.0%  
+
+── POSITION SIZING ─────────────────────────────────────────────────
+  Avg  USDC/trade:   $     15.12
+  Med  USDC/trade:   $      5.40
+  Max  USDC/trade:   $    212.51
+  Avg  shares/trade:       36.2
+  Med  price:             0.400
+  Avg  price:             0.402
+
+── UP vs DOWN PREFERENCE ───────────────────────────────────────────
+  Up  trades:  1,396  (44.6%) | $23,714.04 USDC (50.2%)
+  Down trades: 1,731  (55.4%) | $23,569.08 USDC (49.8%)
+
+── CANDLE-LEVEL BEHAVIOR ────────────────────────────────────────────
+  Unique candles traded:    32
+  Avg  trades/candle:       97.7
+  Med  trades/candle:       84.0
+  Max  trades/candle:       269
+  Avg  USDC/candle:         $1,477.60
+  Med  USDC/candle:         $1,302.18
+  Candles both sides:       31  (96.9%)
+  Candles UP heavy:         12  (37.5%)
+  Candles DOWN heavy:       4  (12.5%)
+  DCA scaling candles:      5  (15.6%)
+
+── TIMING WITHIN CANDLE ─────────────────────────────────────────────
+  Avg  offset from start:   193.5s
+  Med  offset from start:   153.0s
+  Early entries (0-30s):    485  (15.5%)
+  Late  entries (240s+):    775   (24.8%)
+
+  Timing histogram (30s bins):
+      0-30 s     485  ########################
+     30-60 s     271  #############
+     60-90 s     398  ###################
+     90-120s     191  #########
+    120-150s     186  #########
+    150-180s     502  ########################
+    180-210s     236  ###########
+    210-240s      83  ####
+    240-270s     169  ########
+    270-300s     606  ##############################
+    300-330s       0  
+
+── RESOLUTION SCALP BEHAVIOR ────────────────────────────────────────
+  Trades at 0.90+:  2  (0.1%)
+  USDC  at 0.90+:   $24.99  (0.1%)
+
+── SELL BEHAVIOR ────────────────────────────────────────────────────
+  Total sells:       288
+  Avg  sell price:   0.341
+  Med  sell price:   0.348
+  Sells at <=0.25:   47  (16.3%)  [cutting losers]
+  Sells at >=0.90:   0  (0.0%)  [taking profits]
+
+── BURST TRADING ────────────────────────────────────────────────────
+  Bursts (3+ trades in 3s): 267
+  Likely bot:               YES — high burst count
+
+======================================================================

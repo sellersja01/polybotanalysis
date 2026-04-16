@@ -2,17 +2,45 @@
 
 ## What This Project Is
 Automated analysis and trading system for Polymarket Up/Down binary markets.
-Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays $1 if price went up, Down pays $0 (and vice versa). We collect live odds, backtest strategies, and are now building a **cross-platform arbitrage bot** between Polymarket and Kalshi.
+Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays $1 if price went up, Down pays $0 (and vice versa). We collect live odds, backtest strategies, and run paper/live trading bots from a Hetzner VPS in Finland.
+
+## QUICK START (what's running RIGHT NOW)
+
+**Hetzner VPS** (Helsinki, Finland): `ssh root@65.21.107.77`
+
+Three systemd services running 24/7:
+- `collector.service` — Coinbase prices + Poly odds for 8 markets
+- `wallet-collector.service` — 7 tracked wallets → `wallet_trades_v2.db`
+- `paperbot.service` — latency arb paper trader on ETH 5m (DRY_RUN)
+
+Check all services: `systemctl is-active collector wallet-collector paperbot`
+Live bot log: `tail -f /root/paper_bot.log`
+
+## Polymarket Wallet (for live trading)
+- **Polymarket proxy wallet** (funds): `0x6826c3197fff281144b07fe6c3e72636854769ab`
+- **MetaMask EOA** (signer): `0x4795e77317792011c8967de46441f586987101fc`
+- **Polymarket API key**: `019d323e-f149-794e-8c3b-6c1df3877250`
+- **Private key**: NEVER stored in files — pass via `POLY_PRIVATE_KEY` env var only
+- **VPN requirement from US PC**: NordVPN Switzerland exit (Netherlands/Germany BLOCKED for trading)
 
 ## Infrastructure
-- **VPS**: Oracle Cloud Always Free — `132.145.168.14` (opc user)
+
+### Hetzner VPS (PRIMARY — as of 2026-04-08)
+- **IP**: `65.21.107.77`
+- **Location**: Helsinki, Finland (CX23, 4GB RAM, 40GB disk, €4.99/mo)
+- **User**: `root`
+- **SSH command**: `ssh root@65.21.107.77`
+- **SSH key**: `~/.ssh/id_ed25519` (ed25519, auto-used)
+- **Why Helsinki**: Polymarket BLOCKS Germany/Netherlands/US for trading. Finland is NOT on the geoblock list. Confirmed working — buys and sells go through.
+- **Latency**: Polymarket ~28ms, Coinbase ~24ms (vs US PC at 230ms)
+- **No SSH rate limiter** (unlike Oracle)
+
+### Oracle VPS (DEPRECATED)
+- **IP**: `132.145.168.14` (opc user)
 - **SSH key (PC)**: `C:\Users\James\btc-oracle-key\oracle-btc-collector.key`
 - **SSH key (Laptop)**: `C:\Users\selle\oracle.key`
-- **SSH command (PC)**: `ssh -i "C:\Users\James\btc-oracle-key\oracle-btc-collector.key" opc@132.145.168.14`
-- **SSH command (Laptop)**: `ssh -i "C:\Users\selle\oracle.key" opc@132.145.168.14`
-- **NOTE**: User will specify PC or Laptop at the start of each session — use the correct key
-- **Storage**: 30GB boot volume (~11GB used), expandable to 200GB free
-- **Oracle SSH rate limiter**: Blocks after ~4 rapid connections — if SSH fails, wait 10-30 min or have user SSH manually
+- **Why abandoned**: Only 1GB RAM (OOM killed processes), US IP (Polymarket blocks), collectors kept dying
+- **Status**: Still running but unused since 2026-04-08
 
 ## Kalshi API Credentials
 - **Key ID**: `d307ccc8-df96-4210-8d42-8d70c75fe71f`
@@ -21,38 +49,133 @@ Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays 
 - **Signing**: RSA-PSS with SHA-256 (NOT PKCS1v15)
 - Kalshi crypto 15m Up/Down markets are **legal in the US** (CFTC-regulated)
 
-## Processes Running on VPS (all nohup)
-| Process | Log | Purpose |
-|---------|-----|---------|
-| `arb_collector.py` | `arb_collector.log` | Collects Polymarket + Kalshi prices for BTC/ETH/SOL/XRP 15m |
-| `paper_test_dca.py` | `paper_dca.log` | **PRIMARY** — Galindrast DCA paper trader (running overnight since 2026-03-31) |
-| `galindrast_collector.py` | `galindrast_collector.log` | Collects all live Galindrast trades to `galindrast_trades.db` |
+## Services Running on Hetzner VPS (systemd)
 
-**All old processes (collector_v2, paper traders, wallet_collector) were killed on 2026-03-26 to clear the VPS for the arb collector.**
+All three processes run as **systemd services** — survive SSH disconnects, auto-restart on crash, auto-start on reboot.
 
-**Restart commands after reboot:**
+| Service | Script | Log | Purpose |
+|---------|--------|-----|---------|
+| `collector.service` | `/root/collector_v2.py` | `/root/collector.log` | Coinbase prices + Polymarket odds for BTC/ETH/SOL/XRP 5m+15m (8 DBs) |
+| `wallet-collector.service` | `/root/wallet_collector_v2.py` | `/root/wallet_collector.log` | Tracks 7 wallet addresses via Polymarket activity API → `/root/wallet_trades_v2.db` |
+| `paperbot.service` | `/root/live_coinbase.py` | `/root/paper_bot.log` | Latency arb paper trader on ETH 5m (DRY_RUN mode) |
+
+**Service management:**
 ```bash
-nohup python3 -u /home/opc/arb_collector.py > /home/opc/arb_collector.log 2>&1 &
-nohup python3 -u /home/opc/paper_test_dca.py > /home/opc/paper_dca.log 2>&1 &
-nohup python3 -u /home/opc/galindrast_collector.py > /home/opc/galindrast_collector.log 2>&1 &
+# Status
+systemctl is-active collector wallet-collector paperbot
+systemctl status collector --no-pager
+
+# Logs
+journalctl -u collector -f              # live tail
+tail -50 /root/collector.log            # file log
+
+# Restart
+systemctl restart collector
+systemctl restart wallet-collector
+systemctl restart paperbot
 ```
 
-**Check overnight results:**
+**systemd unit files (create once, never need to touch again):**
 ```bash
-tail -50 /home/opc/paper_dca.log
-tail -20 /home/opc/galindrast_collector.log
+# Example: /etc/systemd/system/collector.service
+[Unit]
+Description=Polymarket + Coinbase Collector
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 -u /root/collector_v2.py
+StandardOutput=append:/root/collector.log
+StandardError=append:/root/collector.log
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-## Databases on VPS (`/home/opc/`)
+Then: `systemctl daemon-reload && systemctl enable collector && systemctl start collector`
+
+## Databases on Hetzner VPS (`/root/`)
+| DB | Schema | Purpose |
+|----|--------|---------|
+| `market_btc_5m.db`  | `asset_price` + `polymarket_odds` | BTC Coinbase + Poly 5m candle odds |
+| `market_btc_15m.db` | same | BTC 15m |
+| `market_eth_5m.db`  | same | ETH 5m |
+| `market_eth_15m.db` | same | ETH 15m |
+| `market_sol_5m.db`  | same | SOL 5m |
+| `market_sol_15m.db` | same | SOL 15m |
+| `market_xrp_5m.db`  | same | XRP 5m |
+| `market_xrp_15m.db` | same | XRP 15m |
+| `wallet_trades_v2.db` | `trades` (wallet_name, wallet_addr, timestamp, side, outcome, price, size, ...) | All 7 tracked wallets' trades |
+
+**Critical DB fix (2026-04-15):** `wallet_trades_v2.db` was getting lock errors in WAL mode. Apply once:
+```python
+import sqlite3
+c = sqlite3.connect('/root/wallet_trades_v2.db')
+c.execute('PRAGMA journal_mode=WAL')
+c.commit()
+c.close()
+```
+
+## Tracked Wallets (wallet_collector_v2.py)
+```python
+WALLETS = {
+    "galindrast":  "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
+    "wallet_2":    "0x89b5cdaaa4866c1e738406712012a630b4078beb",
+    "wallet_3":    "0x1f3472bc20dbdee754d09b2fc292efc8a8f0ba6e",
+    "wallet_4":    "0x5d634050ad89f172afb340437ed3170eaa2c9075",
+    "wallet_5":    "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+    "wallet_6":    "0x7da07b2a8b009a406198677debda46ad651b6be2",
+    "wallet_7":    "0x8c901f67b036b5eebab4e1f2f904b8676743a904",
+}
+```
+
+## Deploying code to Hetzner
+From PC PowerShell (not SSH):
+```powershell
+scp c:\Users\James\polybotanalysis\arb_bot\live_coinbase.py root@65.21.107.77:/root/live_coinbase.py
+scp c:\Users\James\polybotanalysis\collector_v2.py root@65.21.107.77:/root/collector_v2.py
+scp c:\Users\James\polybotanalysis\wallet_collector_v2.py root@65.21.107.77:/root/wallet_collector_v2.py
+```
+
+Then SSH in and `systemctl restart <service>` to pick up changes.
+
+## Debugging data gaps
+Find when a collector died:
+```python
+# Run on VPS
+python3 << 'EOF'
+import sqlite3
+from datetime import datetime, timezone
+c = sqlite3.connect('/root/market_btc_5m.db')
+rows = c.execute('SELECT unix_time FROM asset_price ORDER BY unix_time DESC LIMIT 100000').fetchall()
+c.close()
+gaps = []
+for i in range(len(rows) - 1):
+    gap = float(rows[i][0]) - float(rows[i+1][0])
+    if gap > 60:
+        gaps.append((float(rows[i+1][0]), float(rows[i][0]), gap))
+gaps.sort(key=lambda x: x[2], reverse=True)
+for start, end, gap in gaps[:5]:
+    s = datetime.fromtimestamp(start, tz=timezone.utc).strftime('%m-%d %H:%M:%S')
+    e = datetime.fromtimestamp(end, tz=timezone.utc).strftime('%m-%d %H:%M:%S')
+    print(f'{s} -> {e}  gap={gap:.0f}s ({gap/3600:.1f}h)')
+EOF
+```
+
+## Oracle VPS (DEPRECATED `/home/opc/`)
+Kept for historical reference only — no longer running any processes.
 | DB | Contents |
 |----|----------|
-| `arb_collector.db` | **PRIMARY** — live side-by-side Polymarket + Kalshi prices for BTC/ETH/SOL/XRP 15m |
-| `paper_v8_single.db` | Paper trader results (single entry) — no longer running |
-| `paper_v8_layered.db` | Paper trader results (layered) — no longer running |
-| `paper_contrarian.db` | Paper trader results (contrarian DCA) — no longer running |
-| `wallet_trades.db` | All 9 wallet trade history — collector no longer running |
-
-**Note**: The 5m/15m market DBs (market_btc_5m.db etc.) were wiped on 2026-03-26 to free space.
+| `arb_collector.db` | Legacy side-by-side Poly + Kalshi prices |
+| `paper_v8_single.db` | Legacy paper trader (single entry) |
+| `paper_v8_layered.db` | Legacy paper trader (layered) |
+| `paper_contrarian.db` | Legacy paper trader (contrarian DCA) |
+| `wallet_trades.db` | Legacy wallet trade history |
+| `galindrast_trades.db` | Legacy single-wallet collector (replaced by wallet_trades_v2.db on Hetzner) |
 
 ---
 
