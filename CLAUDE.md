@@ -30,6 +30,74 @@ tail -f /root/paper_bot.log      # latency arb
 tail -f /root/collector.log      # collector
 ```
 
+## 📍 SESSION 2026-04-20 — S13 VALIDATED + LIVE BOT READY (GO-LIVE NEXT)
+
+### What we built this session
+1. **Audited paper_s13** against Polymarket gamma API → **94.8% of 427 trades classified correctly**. The DB-based resolver was occasionally wrong (missed final WS tick). True PnL was actually **$698 HIGHER** than reported ($6,348 reported → $7,047 real).
+2. **Created paper_s13api.py** on VPS — same strategy, but uses `gamma-api.polymarket.com/events?slug=X-updown-5m-{cs}` as the authoritative resolver (falls back to DB only if API down). Running as `paper-s13api.service`.
+3. **Built live_s13.py** — live trader. Initially had structural differences from paper (async `try_enter` vs sync `check`) that caused Poly WS backpressure and missed SOL/XRP candles. **Rewrote to be byte-identical to paper_s13api.py** except for:
+   - Env vars (DRY_RUN, TRADE_USD, POLY_PRIVATE_KEY)
+   - `build_clob()` + `place_live_order()` helpers
+   - Inside `check()`: fire-and-forget order placement via `asyncio.create_task(_submit_order_bg(...))`
+   - `resolve_delayed` uses real shares+USDC instead of SHARES=100
+4. **Verified trade-for-trade parity** after fix:
+   - live vs paper: 107 overlapping candles, **104 same direction (97%)**
+   - live vs paperapi: 111 overlapping candles, **104 same direction (94%)**
+   - Candles paper entered but live did NOT: **only 2**
+
+### Services running on VPS as of this session
+| Service | Script | Purpose | Status |
+|---|---|---|---|
+| `paper-s13` | `/root/paper_s13.py` | First CEX Move (DB resolver) — original | active |
+| `paper-s13api` | `/root/paper_s13api.py` | First CEX Move (API resolver) — audit baseline | active |
+| `live-s13` | `/root/live_s13.py` | LIVE trader, $2/trade | active (**DRY_RUN=true**) |
+
+### 🚨 GO-LIVE STEPS (do these on PC)
+SSH into VPS and edit the env file — **paste your private key yourself, do not let Claude type it:**
+```bash
+ssh root@65.21.107.77
+nano /root/.live_s13_env
+```
+
+Change file to:
+```
+DRY_RUN=false
+TRADE_USD=2.0
+POLY_PRIVATE_KEY=0x<your MetaMask EOA private key for 0x4795e77317792011c8967de46441f586987101fc>
+```
+
+Save (Ctrl+X, Y, Enter), then restart:
+```bash
+systemctl restart live-s13
+tail -f /root/live_s13.log
+```
+
+Expected log output within ~10 seconds:
+- `[poly] CLOB creds derived api_key=...` → signing works ✅
+- Banner says `LIVE_S13 [LIVE]` (not `[DRY]`)
+- First entry will trigger when next candle move crosses 0.03%
+- Entry line: `ENTRY[LIVE] [BTC] Up @0.510 mid=0.505 mv=+0.032%`
+- Fill line: `FILLED [BTC] Up shares=3.92 spent=$2.00`
+
+### Before going live — verify these
+- [ ] **USDC balance** in Polymarket proxy wallet `0x6826c3197fff281144b07fe6c3e72636854769ab` is enough. At $2/trade × ~35 trades/hour × ~59% WR, realistic daily cost/profit could swing several hundred $. Recommend **min $100 USDC deposited** before going live.
+- [ ] **Watch for `ORDER_FAIL`** in log. If seen, immediately revert `DRY_RUN=true` and debug.
+- [ ] **Watch for `SKIP ... no fill recorded`** — means order didn't complete before candle resolved.
+
+### Known issues / lingering work
+1. **WS staleness bug**: All three paper/live scripts can silently hang if their Coinbase or Polymarket WebSocket drops incoming messages without raising an exception. Symptoms: heartbeat keeps printing, no new entries. Fix: add a watchdog that forces reconnect if no tick received in 60s. **Not yet implemented.** If a bot goes quiet for 10+ min, `systemctl restart` will unstick it.
+2. **DB resolver accuracy**: paper_s13 uses DB for W/L tracking, which is ~5% inaccurate. Doesn't affect live trading (real $ is determined by market, not bot's internal tagging), but reported PnL is off by ~$700 over 430 trades.
+
+### Files in this repo (committed 2026-04-20)
+| File | Purpose |
+|---|---|
+| `live_s13.py` | **THE LIVE BOT** — identical to paper_s13api structurally, $2/trade |
+| `_compare_bots.py` | Side-by-side trade comparison across 3 bots (shows candle-level divergence) |
+| `_s13_audit.py` | Audit all paper_s13 trades against Polymarket gamma API |
+| `_s13_last10.py` | Pull last 10 trades per asset with Up/Down prices at entry |
+
+---
+
 ## SSH into the Hetzner VPS — Detailed Guide
 
 **Primary command (from PC or laptop):**
