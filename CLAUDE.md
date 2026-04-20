@@ -8,13 +8,99 @@ Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays 
 
 **Hetzner VPS** (Helsinki, Finland): `ssh root@65.21.107.77`
 
-Three systemd services running 24/7:
+Systemd services running 24/7:
 - `collector.service` — Coinbase prices + Poly odds for 8 markets
 - `wallet-collector.service` — 7 tracked wallets → `wallet_trades_v2.db`
 - `paperbot.service` — latency arb paper trader on ETH 5m (DRY_RUN)
+- `paper-s4.service` — Latency Arb 60s exit paper trader (all 4 markets)
+- `paper-s6.service` — Penny Reversal paper trader (all 4 markets)
+- `paper-s11.service` — Mid-Candle Momentum paper trader (all 4 markets)
+- `paper-s12.service` — Both-Sides-Cheap paper trader (all 4 markets)
+- `paper-s13.service` — First CEX Move paper trader (all 4 markets) — **PRIMARY, 70% WR**
 
-Check all services: `systemctl is-active collector wallet-collector paperbot`
-Live bot log: `tail -f /root/paper_bot.log`
+Check all services:
+```bash
+systemctl is-active collector wallet-collector paperbot paper-s4 paper-s6 paper-s11 paper-s12 paper-s13
+```
+
+Live logs:
+```bash
+tail -f /root/paper_s13.log      # primary strat
+tail -f /root/paper_bot.log      # latency arb
+tail -f /root/collector.log      # collector
+```
+
+## SSH into the Hetzner VPS — Detailed Guide
+
+**Primary command (from PC or laptop):**
+```bash
+ssh root@65.21.107.77
+```
+
+**SSH key locations:**
+- PC: `~/.ssh/id_ed25519` (ed25519, auto-used by OpenSSH)
+- If on a new machine, generate + add:
+  ```bash
+  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+  # copy ~/.ssh/id_ed25519.pub content, then paste into Hetzner console → /root/.ssh/authorized_keys
+  ```
+
+**File transfer (scp, from PC to VPS):**
+```bash
+# Upload a Python file
+scp c:/Users/James/polybotanalysis/arb_bot/paper_s13.py root@65.21.107.77:/root/paper_s13.py
+
+# Download a log
+scp root@65.21.107.77:/root/paper_s13.log c:/Users/James/polybotanalysis/logs/
+
+# Download a database (stop collector first to avoid corruption)
+ssh root@65.21.107.77 "systemctl stop collector"
+scp root@65.21.107.77:/root/market_btc_5m.db c:/Users/James/polybotanalysis/
+ssh root@65.21.107.77 "systemctl start collector"
+```
+
+**Run a one-off remote command without interactive shell:**
+```bash
+ssh root@65.21.107.77 "systemctl restart paper-s13"
+ssh root@65.21.107.77 "tail -20 /root/paper_s13.log"
+ssh root@65.21.107.77 "grep 'S13 |' /root/paper_s13.log | tail -1"
+```
+
+**Run a multi-line Python script remotely (WARNING: bash heredoc with `$` escapes can choke — upload the file with scp instead):**
+```bash
+# BAD — dollar signs and backticks in heredoc mangle
+ssh root@65.21.107.77 "python3 << EOF ... EOF"
+
+# GOOD — write locally, scp, execute
+scp my_script.py root@65.21.107.77:/tmp/my_script.py
+ssh root@65.21.107.77 "python3 /tmp/my_script.py"
+```
+
+**Common ops:**
+```bash
+# Service control
+systemctl is-active <service>            # check if running
+systemctl status <service> --no-pager    # full status
+systemctl restart <service>              # restart
+systemctl stop <service>                 # stop
+journalctl -u <service> -n 100           # last 100 systemd log lines
+journalctl -u <service> -f               # follow systemd log
+
+# File-based logs
+tail -f /root/<log>                       # live tail
+> /root/<log>                             # clear a log (before fresh test run)
+
+# Disk / resource
+df -h                                     # disk usage
+free -h                                   # ram usage
+top                                       # live process view
+```
+
+**Troubleshooting:**
+- **Connection reset by peer**: usually means heredoc script had bash syntax issues. Write the script locally and scp it up.
+- **"Permission denied (publickey)"**: SSH key missing or wrong. Verify `~/.ssh/id_ed25519` exists and `~/.ssh/id_ed25519.pub` is in `/root/.ssh/authorized_keys` on the VPS.
+- **Service won't restart**: check `journalctl -u <service> -n 50` for Python traceback.
+- **DB locked**: check if collector is running. Use `sqlite3 /root/market_btc_5m.db "PRAGMA journal_mode=WAL"` to enable WAL.
 
 ## Polymarket Wallet (for live trading)
 - **Polymarket proxy wallet** (funds): `0x6826c3197fff281144b07fe6c3e72636854769ab`
@@ -51,13 +137,18 @@ Live bot log: `tail -f /root/paper_bot.log`
 
 ## Services Running on Hetzner VPS (systemd)
 
-All three processes run as **systemd services** — survive SSH disconnects, auto-restart on crash, auto-start on reboot.
+All processes run as **systemd services** — survive SSH disconnects, auto-restart on crash, auto-start on reboot.
 
 | Service | Script | Log | Purpose |
 |---------|--------|-----|---------|
 | `collector.service` | `/root/collector_v2.py` | `/root/collector.log` | Coinbase prices + Polymarket odds for BTC/ETH/SOL/XRP 5m+15m (8 DBs) |
 | `wallet-collector.service` | `/root/wallet_collector_v2.py` | `/root/wallet_collector.log` | Tracks 7 wallet addresses via Polymarket activity API → `/root/wallet_trades_v2.db` |
 | `paperbot.service` | `/root/live_coinbase.py` | `/root/paper_bot.log` | Latency arb paper trader on ETH 5m (DRY_RUN mode) |
+| `paper-s4.service` | `/root/paper_s4.py` | `/root/paper_s4.log` | S4 — Latency arb 60s exit (all 4 markets) |
+| `paper-s6.service` | `/root/paper_s6.py` | `/root/paper_s6.log` | S6 — Penny reversal (ask ≤ 0.10, hold to resolution) |
+| `paper-s11.service` | `/root/paper_s11.py` | `/root/paper_s11.log` | S11 — Mid-candle momentum (t+150s, mid > 0.60) |
+| `paper-s12.service` | `/root/paper_s12.py` | `/root/paper_s12.log` | S12 — Both sides cheap (up+dn ask sum < 0.90) |
+| `paper-s13.service` | `/root/paper_s13.py` | `/root/paper_s13.log` | **S13 — First CEX Move (PRIMARY strat, 70% WR)** |
 
 **Service management:**
 ```bash
@@ -801,3 +892,93 @@ tail -50 /home/opc/paper_dca.log   # check results
 5. **Keep galindrast_collector running on Oracle VPS** — track their evolving strategy
 6. **Keep arb_collector running on Oracle VPS** — cross-platform data for backup strategy
 7. **Cross-platform arb (on pause)** — revisit when latency arb slows down
+
+---
+
+## S13 — First CEX Move (PRIMARY, 2026-04-19)
+
+### Strategy
+- Watch Coinbase price vs the candle's **open price**.
+- If Coinbase moves **≥ 0.03%** AND Poly mid of the matching side < 0.55 AND ask < 0.75 → buy that side.
+- **One trade per candle per asset.** Hold to resolution.
+- Entry window: **10s–270s** into the candle (matches backtest's `offset >= 10`).
+- Shares: **100** (~$47 avg deployed per trade).
+
+### Files
+| File | Purpose |
+|------|---------|
+| `arb_bot/paper_s13.py` | Live paper trader |
+| `backtest_s13.py` | Backtest on collector DB |
+| `paper_s4.py / s6.py / s11.py / s12.py` | Other paper traders (less profitable) |
+
+### Backtest Results (Apr 8–19, 148.7h actual data across all 4 assets)
+
+| Market | Hours | Trades | Wins | WR% | Avg win | Avg loss | Net PnL | $/day |
+|--------|-------|--------|------|-----|---------|----------|---------|-------|
+| BTC | 148.7 | ~1700 | — | 65.1% | — | — | +$20,622 | ~$3,325 |
+| ETH | 148.7 | ~1700 | — | 57.7% | — | — | +$18,220 | ~$2,940 |
+| SOL | 148.7 | ~1700 | — | 57.2% | — | — | +$16,445 | ~$2,650 |
+| XRP | 148.7 | ~1700 | — | 58.6% | — | — | +$16,768 | ~$2,700 |
+| **Total** | | | | **~60%** | | | **+$72,055** | **~$11,620** |
+
+### Live Paper Results (1.5h, post-fix)
+
+| Metric | Value |
+|--------|-------|
+| Trades | 80 (4 markets) |
+| WR | **70%** (55W / 25L) |
+| Avg win | +$51.61 |
+| Avg loss | −$48.41 |
+| Avg entry price (Up) | 0.467 |
+| Avg entry price (Down) | 0.484 |
+| Avg $/trade deployed | $47.55 |
+| Net PnL | **+$1,628** (≈$1,085/hr) |
+| ROI on deployed capital | **~43%** |
+
+### Slippage Cushion
+At 69% WR, breakeven requires entry cost ≤ 0.69 per share. Avg entry is 0.484 (with fees), so the cushion is **~20¢/share (~$20/trade)** before expected value goes negative. Realistic safe margin is ~10¢/share since real slippage also depresses WR.
+
+### Winner Detection — 3-stage resolve (fixed 2026-04-19)
+
+**Bug:** original live bot used its WS state at the moment of candle rollover to determine the winner. This state often didn't match the DB's last tick — the bot missed the final resolution messages or had stale cached prices from mid-candle wobble. Result: live flipped winners on some candles, showed 21% WR vs backtest's 60%.
+
+**Fix:** after candle end, wait 5s, then resolve via fallback chain:
+1. **DB** — query `/root/market_<asset>_5m.db` for the last `polymarket_odds` tick of the candle (same logic as the backtest). Zero-ask rule first, then higher-mid fallback.
+2. **API** — fetch `https://gamma-api.polymarket.com/events?slug=<asset>-updown-5m-<cs>`. Read `outcomePrices`; whichever is ≥0.99 wins.
+3. **WS snapshot** — last cached bid/ask from WS right before rollover (zero-ask rule).
+
+Each resolution logs a tag `(DB)`, `(API)`, or `(WS)` so you can see which source was used. In practice, **(DB) hits 100% of the time** because the collector writes ticks in real time.
+
+**Post-fix result:** 70% WR on 80 live trades, matches backtest expectation.
+
+### Winner logic details (the "zero-ask rule")
+```python
+# If one side has zero asks, it's the winner (nobody sells a winning token)
+if up_ask == 0 and dn_ask > 0: winner = "Up"
+elif dn_ask == 0 and up_ask > 0: winner = "Down"
+else:
+    # Fallback: higher mid wins
+    up_mid = (up_bid + up_ask) / 2
+    dn_mid = (dn_bid + dn_ask) / 2
+    winner = "Up" if up_mid >= dn_mid else "Down"
+```
+User rationale: "polymarket odds will eventually be for example 0 cents up and 1 cent down because nobody wants to sell their up position because its pretty much already guaranteed to win" — so the side with empty asks is the winner.
+
+### Session changelog (2026-04-19)
+1. Deployed 5 paper traders (S4, S6, S11, S12, S13) as systemd services.
+2. Discovered S13 showing 36% WR live vs 60% backtest — winner detection bug.
+3. First fix attempt: use `last_up_mid` tracked during the candle — rejected (user: can't rely on Coinbase close because Polymarket uses a different price feed).
+4. Second fix: apply **zero-ask rule** for winner (user direction). Applied to S13, S6, S11.
+5. Pulled fresh collector data with services stopped (preserves old DBs): `hetzner_apr19/`. 269h span but 148.7h actual data due to two gaps (95.5h Apr 8–12 and 25.1h Apr 12–14) before services were set up as systemd.
+6. Re-ran S13 backtest on fresh data: **+$72,055 / ~$11,620/day**, confirmed edge persists.
+7. Still saw 21–29% WR live on 33 trades → discovered bot's in-memory WS state didn't match the DB's last tick.
+8. Aligned live with backtest: `age>=10` (was 5), `candle_open` = first CB tick inside candle (was last pre-rollover tick).
+9. Replaced `resolve()` with **async 5s-delayed 3-stage fallback**: DB → API → WS snapshot. Fire-and-forget via `asyncio.create_task` so new candle entries aren't blocked.
+10. Live WR jumped to **70%** with `(DB)` resolutions on all 80 trades.
+
+### Known caveats
+- **Sample size small** (80 trades). Needs 500+ to be confident 70% holds.
+- **Look-ahead bias check**: backtest uses DB's last tick; live now does too — consistent.
+- **Slippage not modeled**: real fills on Polymarket may fall 1-2¢ worse than quoted ask, eating into the 20¢ cushion.
+- **0.03% threshold** is tiny — crypto crosses it in almost every candle (~100% entry rate).
+- **Edge compression risk**: as more bots front-run Polymarket on CEX moves, the stale-odds window will shrink. Monitor WR weekly.
