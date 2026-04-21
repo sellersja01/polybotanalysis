@@ -9,28 +9,183 @@ Every 5 or 15 minutes, Polymarket opens a BTC/ETH/SOL/XRP market: Up token pays 
 **Hetzner VPS** (Helsinki, Finland): `ssh root@65.21.107.77`
 
 Systemd services running 24/7:
-- `collector.service` — Coinbase prices + Poly odds for 8 markets
+- `collector.service` — Coinbase prices + Poly odds for 8 markets (rollover bug fixed 2026-04-21)
 - `wallet-collector.service` — 7 tracked wallets → `wallet_trades_v2.db`
 - `paperbot.service` — latency arb paper trader on ETH 5m (DRY_RUN)
-- `paper-s4.service` — Latency Arb 60s exit paper trader (all 4 markets)
-- `paper-s6.service` — Penny Reversal paper trader (all 4 markets)
-- `paper-s11.service` — Mid-Candle Momentum paper trader (all 4 markets)
-- `paper-s12.service` — Both-Sides-Cheap paper trader (all 4 markets)
-- `paper-s13.service` — First CEX Move paper trader (all 4 markets) — **PRIMARY, 70% WR**
+- `paper-s4.service` — Latency Arb 60s exit paper trader
+- `paper-s6.service` — Penny Reversal paper trader
+- `paper-s11.service` — Mid-Candle Momentum paper trader
+- `paper-s12.service` — Both-Sides-Cheap paper trader
+- `paper-s13.service` — First CEX Move paper trader (v1, DB resolver) — LEGACY
+- `paper-s13api.service` — paper_s13 with API resolver — LEGACY BASELINE
+- `paper-s13-v2.service` — paper_s13 with WS fix applied — RECENT
+- **`live-s13-v3.service` — PRIMARY LIVE BOT** (stopped by default, start only with user's OK)
+- `live-s13.service` — old v1 live bot (has WS bug, retained for reference only; stopped)
 
 Check all services:
 ```bash
-systemctl is-active collector wallet-collector paperbot paper-s4 paper-s6 paper-s11 paper-s12 paper-s13
+systemctl is-active collector wallet-collector paperbot paper-s4 paper-s6 paper-s11 paper-s12 paper-s13 paper-s13api paper-s13-v2 live-s13-v3 live-s13
 ```
 
 Live logs:
 ```bash
-tail -f /root/paper_s13.log      # primary strat
-tail -f /root/paper_bot.log      # latency arb
+tail -f /root/live_s13_v3.log    # PRIMARY live bot (when running)
+tail -f /root/paper_s13.log      # legacy paper baseline
 tail -f /root/collector.log      # collector
 ```
 
-## 📍 SESSION 2026-04-21 (UTC) — LIVE POST-MORTEM + SLIPPAGE DEBUG + V2 BUILT
+**⚠️ Rule: never start/restart `live-s13-v3` without explicit user permission.** Stopping it doesn't need permission. Paper bots / DRY_RUN can be started freely.
+
+## 📍 SESSION 2026-04-21 (UTC, EVENING) — V3 BUILT, HARDENED, VALIDATED, BACKTESTED
+
+### TL;DR
+Built **`live_s13_v3.py`** — the new primary live bot. Fixed the WS book-handler bug (bot was reading stale 30-second-old opening snapshots), added pre-sign hardening, keep-alive pinger, batch order dispatcher, persistent MAX_FIRES cap, and microsecond latency instrumentation. **Slippage dropped from ~19.5¢ mean (v1) to ~6¢ mean (v3).** Measured real maker reprice speed: median 704ms — meaning our 400ms latency actually beats ~58% of reprice events, much more winnable than the initial "10-30ms" hypothesis. Backtested v3 on 7.7 days of local data with 6¢ slippage: **+$958 net, 57% WR, 3,261 trades, ~$125/day at $2/trade**. Profitable.
+
+### Key findings (measured, not hypothesized)
+
+1. **WS data staleness was the hidden killer.** `live_s13.py` only processed `book` (snapshot) events from Polymarket WS and silently ignored `price_change` (incremental diff) events. Result: bot's local book was frozen at candle-opening snapshot while the real market moved. Verified by capturing a full candle's ticks:
+
+   | Asset | Bot's view (v1) | Collector's real view | Gap |
+   |---|---|---|---|
+   | BTC Up | mid=0.475 | mid=0.015 | **46¢** |
+   | ETH Up | mid=0.505 | mid=0.065 | 44¢ |
+   | XRP Down | mid=0.375 | mid=0.535 | 16¢ |
+   | SOL Up | mid=0.480 | mid=0.655 | 18¢ |
+
+   The "26¢ slippage" from the morning session was therefore ~half phantom (bot firing based on stale opening prices the market had already moved past) and ~half real (book continues to move in the ~400ms post window).
+
+2. **Real Polymarket maker reprice speed (MEASURED, not assumed)**. Across 255 CEX trigger events on BTC in a 2-hour window (analyzed via `_reprice_speed.py`):
+
+   | Reprice delay | Value |
+   |---|---|
+   | min | 6 ms |
+   | p10 | 114 ms |
+   | p25 | 287 ms |
+   | **MEDIAN** | **704 ms** |
+   | p75 | 2,131 ms |
+   | p90 | 3,705 ms |
+
+   Only 2% of reprices happen in ≤30ms. **Our 445ms live latency beats ~58% of real-world maker reprice events.** The earlier "10-30ms maker speed" was wrong. Speed optimization is worth doing — every 100ms saved buys ~10-15% more winning trades.
+
+3. **Own latency breakdown at ~445ms** (measured with µs instrumentation in `_submit_order_bg`):
+
+   | Component | Time |
+   |---|---|
+   | pre (task spawn + queue dispatch) | 1-30 ms |
+   | sign (0 when pre-signed path hits) | **0 ms** PS / 175-460 ms OD |
+   | post (HTTPS round-trip to CLOB) | 330-440 ms (warm TLS), 500+ ms cold |
+   | **TOTAL (PS path, warm)** | **~400 ms** |
+
+   The ~330ms post time is ~50ms network RTT + ~280ms Polymarket server processing. **httpx already uses persistent HTTP/2 with keep-alive** — connection reuse was already there, the "100ms session reuse win" I proposed didn't exist. Server-side Polymarket processing (matching engine + DB write + signature verify) is the hard floor.
+
+4. **WebSocket order submission is NOT supported by Polymarket** (verified across 5 sources: official docs, 3 official SDKs, third-party repos, GitHub issues). All orders must go via HTTP POST. Dead idea.
+
+5. **Pre-sign is safe and saves ~175ms on hot path**. Polymarket orders have `expiration="0"` (never expire) and each signing generates a unique salt, so pre-signing Up + Down at candle open is safe. Confirmed working: `FILLED[PS] ... sign=0ms` across 10+ live trades.
+
+6. **Collector had a rollover bug causing 5-minute data gaps**. `manage_market()` in `/root/collector_v2.py` was awaiting the old WS task's 30s timeout before starting the new candle's subscription, AND retrying `fetch_tokens` at 1Hz if Polymarket was slow to publish the new market. Fix: start new WS task before cancelling old (fire-and-forget cancel), retry `fetch_tokens` at 0.3s intervals. Patched and deployed on VPS.
+
+### What we built (all committed)
+
+| File | Purpose |
+|---|---|
+| **`live_s13_v3.py`** | **THE PRIMARY LIVE BOT.** Fixed WS handler, pre-sign, batch dispatcher, keep-alive, retry hardening, watchdog, MAX_FIRES with persistent counter, µs latency instrumentation |
+| `_backtest_v3.py` | Replays v3 logic against collector data with configurable slippage. Ran on 7.7 days local data |
+| `_reprice_speed.py` | Measures maker reprice delay distribution from collector data |
+| `_candle_spreadsheet.py` | Tick-level CSV export for a specific 5m candle + bot signals (v1 log) |
+| `_candle_spreadsheet_v3.py` | Same as above but reads v3 log |
+| `_tick_export.py` | Targeted tick-by-tick export around specific trade timestamps |
+| `_latency_xref.py` | Cross-references live bot trades against collector ticks |
+| `live_trades_log.md` | Raw log of live trades + UI-confirmed fill prices |
+| `candle_20260421_1815.csv` | Captured candle 18:15-18:20 UTC (v1 bot, shows the staleness) |
+| `candle_v3_20260421_1845.csv` | Captured candle 18:45-18:50 UTC (v3 bot, shows the fix working) |
+| `/root/collector_v2.py` (on VPS) | Patched for rollover bug |
+
+### `live_s13_v3.py` architecture (what's different from v1)
+1. **WS book state**: `up_book`/`dn_book` as price→size dicts. Handles `book` (replace entire) + `price_change` (update specific levels). Recomputes best bid/ask from live book.
+2. **Pre-signed orders**: At candle open, pre-sign Up + Down market orders for each of 4 assets (8 total). Store signed blobs in asset state.
+3. **Retry with exp backoff**: `_presign` retries up to 5 times (0.5s → 1s → 2s → 4s → 8s). Bails if candle rolls over.
+4. **Watchdog**: Every 5s, checks each asset. If any side has no pre-signed order mid-candle, spawns a retry.
+5. **Batch dispatcher**: `asyncio.Queue` + `_order_dispatcher` task. When multiple signed orders land in the queue at once, combines into `post_orders()` call instead of N serial `post_order()`.
+6. **TLS keep-alive pinger**: Every 3s, sends a cheap GET via the shared httpx client to keep TCP/TLS warm. Saves ~70ms on cold-start after market quiet periods.
+7. **MAX_FIRES persistent counter**: Env var `MAX_FIRES=1` caps live fires. Counter persists to `/tmp/live_s13_v3_fires.txt` so service restarts don't reset.
+8. **Loud warnings**: `WARN_NO_PRESIGN`, `PRESIGN_FAIL`, `PRESIGN_GIVEUP`, `PRESIGN_STALE` events all emit distinctive log lines.
+9. **Microsecond latency**: all ENTRY + FILLED lines use `%H:%M:%S.%f` timestamps. FILLED log includes `pre/sign/post/TOTAL` breakdown.
+
+### Live trading validation (2026-04-21 evening — real money)
+
+11 live trades across 4 sessions. All PS mode, pre-sign working.
+
+| Date | Asset | Side | Log ask | Fill | Slippage | Latency |
+|---|---|---|---|---|---|---|
+| 18:57 | BTC | Up | 0.550 | 0.66 | 11¢ | 464ms |
+| 18:57 | ETH | Up | 0.530 | 0.65 | 12¢ | 438ms |
+| 20:01 | ETH | Up | 0.510 | 0.56 | **5¢** | 365ms |
+| 20:05 | XRP | Up | 0.550 | 0.63 | 8¢ | 397ms |
+| 20:05 | SOL | Down | 0.380 | 0.61 | 23¢ *(OD fallback)* | 442ms |
+| 20:05 | BTC | Down | 0.360 | 0.67 | 31¢ *(OD fallback)* | 1333ms |
+| 20:05 | ETH | Down | 0.380 | 0.65 | 27¢ *(OD fallback)* | 1490ms |
+| 20:15 | SOL | Down | 0.500 | **0.50** | **0¢** | 429ms |
+| 20:15 | ETH | Down | 0.530 | 0.56 | 3¢ | 404ms |
+| 20:15 | XRP | Up | 0.420 | 0.45 | 3¢ | 348ms |
+
+**Mean slippage when PS worked: ~6¢** (vs v1 mean of 19.5¢). The 20:05 cluster got nuked by a Polymarket API hiccup that caused presigns to fail — bot fell back to on-demand signing with 1000+ ms total latency and proportionally worse slippage. **Confirmed directly: slippage scales with latency.** Hardening was added after this session (retry + watchdog) to prevent recurrence.
+
+### Backtest results (local data, 7.7 days, Mar 16-24 2026)
+
+Ran `_backtest_v3.py` with 6¢ flat slippage and exact v3 filter logic:
+
+| Asset | Trades | WR | Avg $/trade | Total PnL |
+|---|---|---|---|---|
+| BTC | 855 | 58.7% | +$0.48 | +$413.87 |
+| ETH | 833 | 58.0% | +$0.40 | +$334.94 |
+| SOL | 836 | 54.4% | +$0.11 | +$89.73 |
+| XRP | 737 | 57.0% | +$0.16 | +$119.98 |
+| **TOTAL** | **3,261** | **57.0%** | **+$0.29** | **+$958.51** |
+
+Daily at $2/trade: **~$125/day**. Scales linearly: $20/trade → $1,252/day, $100/trade → $6,263/day.
+
+**By entry-price band (the real story):**
+| Effective fill | Trades | WR | Avg $/trade | Total |
+|---|---|---|---|---|
+| **0-10¢** (asymmetric lottery) | 27 | 51.9% | **+$10.79** | **+$291.24** |
+| 10-25¢ | 105 | 43.8% | +$4.06 | +$426.41 |
+| 25-45¢ | 243 | 44.4% | +$0.43 | +$104.19 |
+| 45-55¢ | 634 | 55.7% | +$0.19 | +$120.45 |
+| 55-70¢ (bulk) | 2,246 | 59.6% | +$0.01 | +$25.52 |
+| 70-82¢ | 6 | 16.7% | −$1.55 | −$9.30 |
+
+**75% of profit ($717) comes from just 132 trades (4% of total) in the 0-25¢ "asymmetric lottery" band.** The 55-70¢ bulk is nearly break-even. 70+¢ loses money (small sample).
+
+### Current state of services after this session
+| Service | Status | Purpose |
+|---|---|---|
+| `collector.service` | 🟢 active | Patched for rollover bug, healthy |
+| `wallet-collector.service` | 🟢 active | Unchanged |
+| `paper-s13.service` | 🟢 active | Legacy v1 DB-resolver paper baseline |
+| `paper-s13api.service` | 🟢 active | API-resolver paper baseline |
+| `paper-s13-v2.service` | 🟢 active | WS-fix paper trader |
+| `live-s13.service` | 🔴 stopped | Retained for reference, do not use |
+| **`live-s13-v3.service`** | 🔴 **stopped** | **PRIMARY LIVE BOT** — start only with user's explicit OK |
+
+### Next-session TODO list
+1. **Tighten ask ceiling from 0.75 → 0.55** (1-line change). Backtest shows 70+¢ band loses money and 55-70¢ band is break-even (+$25 on 2,246 trades). Cutting those would dramatically improve avg $/trade without losing the profitable segments. Do this before next live run.
+2. **Do NOT add a sub-20¢ floor.** Backtest shows 0-25¢ band is 75% of profits. Confirmed asymmetric bet strategy is working.
+3. **Run extended v3 live test** (2-4 hours, MAX_FIRES=0) to get a real-money sample that matches the 3,261-trade backtest's 57% WR. Current live sample is only 10 trades.
+4. **Backtest with non-flat slippage** — real slippage is ~0-3¢ on extremes, ~5-12¢ on mid, ~25¢+ when presign fails. Use distribution from measured data, not flat 6¢, for more honest projection.
+5. **Follow-mode strategy** as a fork — subscribe to Polymarket trade feed, enter AFTER maker frontrunners confirm direction at 0.60+. Could beat the current strategy on WR if speed compression continues.
+6. **Test batch dispatcher in the wild** — the infrastructure is there but no candle has fired 2+ PS orders simultaneously yet to verify.
+7. **Live PnL audit** — cross-check bot-logged fills against Polymarket UI positions after ~1 day of running to confirm no hidden divergences.
+
+### Important lessons logged this session
+- My initial "maker reprices in 10-30ms" was wrong. Measured reality is 704ms median. **Don't trust mental models, measure.**
+- Persistent HTTP keep-alive was already implemented in py_clob_client (httpx.Client(http2=True) module-level singleton). Proposed "session reuse" win didn't exist.
+- WS submission for orders doesn't exist on Polymarket. Verified through 5 independent sources before building anything.
+- Restart resets in-memory state. Use persistent files (`/tmp/live_s13_v3_fires.txt`) for safety counters.
+- Disk-full (from too many sqlite3 snapshot files in /tmp) silently breaks collector WS subscribes. Clean `/tmp/*.db` after analysis scripts.
+
+---
+
+## 📍 SESSION 2026-04-21 (UTC, MORNING) — LIVE POST-MORTEM + SLIPPAGE DEBUG + V2 BUILT
 
 ### TL;DR
 Flipped `live-s13` to real money briefly (~6 fills, ~$12 deployed, $1.47 realized loss + 4 positions open at time of stop). **Every live fill was 15–29¢ worse than what the bot's log said.** Investigated — root cause is the bot acting on a stale view of the book, then ORDER placement racing an already-moved market run by maker bots that cancel+repost faster than we fire. Built v2 copies of all three bots with a corrected WS handler. Confirmed with a diagnostic that the real problem isn't just the WS bug — **maker bots reprice the book by cancel/repost in ~10–30 ms**, so no reasonable Python latency win lets us catch the "pre-move" price. Service `live-s13` is stopped + disabled; `paper-s13-v2` running DRY alongside v1s for comparison.

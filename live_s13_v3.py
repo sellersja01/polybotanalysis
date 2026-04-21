@@ -1,11 +1,19 @@
 """
-LIVE_S13: First CEX Move — LIVE trader
-Structurally IDENTICAL to paper_s13api.py except:
-  - Env vars (DRY_RUN, TRADE_USD, POLY_PRIVATE_KEY)
-  - build_clob() + place_live_order() helpers
-  - Inside check(): fire-and-forget order placement; compute shares from TRADE_USD/ask
-  - resolve_delayed uses real shares+USDC instead of SHARES=100
-Every WebSocket loop, check() flow, and setup() path is byte-identical to paper.
+LIVE_S13_V3: First CEX Move — LIVE trader with FIXED WS book handler.
+
+THE KEY FIX vs live_s13.py:
+  Old code only read `bids`/`asks` on each WS message (treating every message
+  as a full snapshot). It silently ignored `price_change` events (incremental
+  diffs), so the bot's view of the book stayed frozen at the opening snapshot
+  while the real market moved. Data-staleness measured at 15-45¢ vs the
+  collector — bot was entering trades on ~30s-stale prices.
+
+  v3 maintains a full local book as price→size dict and handles both `book`
+  (snapshot) and `price_change` (diff) events — same pattern as collector_v2.py.
+  Best bid/ask are always computed from the live book.
+
+Everything else (pre-sign, batch dispatcher, keep-alive pinger, latency
+instrumentation) is unchanged from live_s13.py.
 """
 import asyncio, json, time, aiohttp, websockets, sqlite3, os
 from collections import deque
@@ -17,6 +25,18 @@ DB_DIR = "/root"
 # ── LIVE-specific env config ─────────────────────────────────────────────────
 TRADE_USD   = float(os.environ.get("TRADE_USD", "2.0"))
 DRY_RUN     = os.environ.get("DRY_RUN", "true").lower() != "false"
+MAX_FIRES   = int(os.environ.get("MAX_FIRES", "0"))  # 0 = unlimited. Caps LIVE fires only.
+FIRES_FILE  = "/tmp/live_s13_v3_fires.txt"  # persistent counter — survives restart
+
+def _read_fires():
+    try:
+        with open(FIRES_FILE, "r") as f: return int(f.read().strip() or "0")
+    except FileNotFoundError: return 0
+    except Exception: return 0
+def _write_fires(n):
+    try:
+        with open(FIRES_FILE, "w") as f: f.write(str(n))
+    except Exception: pass
 POLY_KEY    = os.environ.get("POLY_PRIVATE_KEY", "")
 POLY_FUNDER = "0x6826c3197fff281144b07fe6c3e72636854769ab"
 POLY_CLOB   = "https://clob.polymarket.com"
@@ -110,7 +130,7 @@ async def get_market(slug):
 
 async def main():
     mode_tag = "DRY" if DRY_RUN else "LIVE"
-    print("="*70+f"\n  LIVE_S13 [{mode_tag}]: First CEX Move (0.03%) — ${TRADE_USD}/trade — All 4 markets\n"+"="*70, flush=True)
+    print("="*70+f"\n  LIVE_S13_V3 [{mode_tag}]: First CEX Move (0.03%) — ${TRADE_USD}/trade — FIXED WS handler\n"+"="*70, flush=True)
     clob = build_clob()
 
     cb_prices={a["cb"]:0.0 for a in ASSETS}
@@ -119,8 +139,14 @@ async def main():
         assets[cfg["label"]]={**cfg,"candle_ts":0,"candle_open":None,"up_token":None,"dn_token":None,
             "up_bid":0.0,"up_ask":0.0,"dn_bid":0.0,"dn_ask":0.0,"question":"","entered":False,"trade":None,
             "last_cb_price":0.0,
-            "signed_up":None,"signed_dn":None}  # pre-signed orders (set by _presign)
+            "signed_up":None,"signed_dn":None,  # pre-signed orders (set by _presign)
+            # v3: full book state (price → size) for each side, maintained from `book` + `price_change` events
+            "up_book":{"bids":{},"asks":{}},
+            "dn_book":{"bids":{},"asks":{}}}
     total_pnl=0.0;total_trades=0;total_wins=0
+    live_fires = _read_fires()  # persistent counter — survives service restart
+    if live_fires > 0:
+        print(f"[startup] loaded live_fires={live_fires} from {FIRES_FILE} (MAX_FIRES={MAX_FIRES})", flush=True)
 
     def um(a): return (a["up_bid"]+a["up_ask"])/2 if a["up_bid"]>0 and a["up_ask"]>0 else 0
     def dm(a): return (a["dn_bid"]+a["dn_ask"])/2 if a["dn_bid"]>0 and a["dn_ask"]>0 else 0
@@ -159,24 +185,64 @@ async def main():
               f"shares={shares:.3f} spent=${spent:.2f} payout=${payout:.2f} "
               f"pnl=${pnl:+.2f} ({src}) | {total_trades}t WR={wr:.0f}% ${total_pnl:+.2f}", flush=True)
 
-    async def _presign(a, token_id, side_label):
+    async def _presign(a, token_id, side_label, expected_candle_ts=None):
         """Pre-build + pre-sign a $TRADE_USD market BUY for this token.
-        Runs in a background thread so it doesn't block the event loop.
+        Retries up to 5 times with exponential backoff (0.5→1→2→4→8s).
+        Bails out early if candle rolls over (tokens become stale).
         Saves the signed order in a['signed_up'] or a['signed_dn']."""
         if DRY_RUN or clob is None: return
-        try:
-            from py_clob_client.clob_types import MarketOrderArgs
-            t0 = time.time()
-            args = MarketOrderArgs(token_id=token_id, amount=round(TRADE_USD,2), side="BUY", price=0.99)
-            signed = await asyncio.to_thread(clob.create_market_order, args)
-            dt_ms = (time.time() - t0) * 1000
-            key = "signed_up" if side_label == "Up" else "signed_dn"
-            a[key] = signed
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-            print(f"  [{ts}] PRESIGN [{a['label']}] {side_label} ready in {dt_ms:.0f}ms", flush=True)
-        except Exception as e:
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-            print(f"  [{ts}] PRESIGN_FAIL [{a['label']}] {side_label}: {e}", flush=True)
+        key = "signed_up" if side_label == "Up" else "signed_dn"
+        # Skip if already have a signed order (e.g., watchdog raced with entry path)
+        if a.get(key) is not None: return
+        max_attempts = 5
+        delay = 0.5
+        from py_clob_client.clob_types import MarketOrderArgs
+        for attempt in range(1, max_attempts + 1):
+            # Don't waste effort on a candle we've already rolled past
+            if expected_candle_ts is not None and a["candle_ts"] != expected_candle_ts:
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                print(f"  [{ts}] PRESIGN_STALE [{a['label']}] {side_label} — candle rolled over, bailing", flush=True)
+                return
+            try:
+                t0 = time.time()
+                args = MarketOrderArgs(token_id=token_id, amount=round(TRADE_USD,2), side="BUY", price=0.99)
+                signed = await asyncio.to_thread(clob.create_market_order, args)
+                dt_ms = (time.time() - t0) * 1000
+                a[key] = signed
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                suffix = f" (retry {attempt})" if attempt > 1 else ""
+                print(f"  [{ts}] PRESIGN [{a['label']}] {side_label} ready in {dt_ms:.0f}ms{suffix}", flush=True)
+                return
+            except Exception as e:
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                print(f"  [{ts}] PRESIGN_FAIL [{a['label']}] {side_label} (attempt {attempt}/{max_attempts}): {e}", flush=True)
+                if attempt < max_attempts:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 10.0)
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        print(f"  [{ts}] PRESIGN_GIVEUP [{a['label']}] {side_label} — triggers will fall back to OD (slow path)", flush=True)
+
+    async def _presign_watchdog():
+        """Every 5s, check each asset. If any side is missing a signed order
+        mid-candle, kick off a presign attempt. Catches orphans from transient
+        API failures."""
+        if DRY_RUN or clob is None: return
+        await asyncio.sleep(10)  # give initial presigns a chance
+        while True:
+            try:
+                for a in assets.values():
+                    if a["candle_ts"] <= 0: continue
+                    now = time.time()
+                    age = now - a["candle_ts"]
+                    # Only attempt mid-candle — candle almost ending is wasted effort
+                    if age < 5 or age > INTERVAL - 60: continue
+                    if a["up_token"] and a.get("signed_up") is None:
+                        asyncio.create_task(_presign(a, a["up_token"], "Up", a["candle_ts"]))
+                    if a["dn_token"] and a.get("signed_dn") is None:
+                        asyncio.create_task(_presign(a, a["dn_token"], "Down", a["candle_ts"]))
+            except Exception as e:
+                print(f"[watchdog] error: {e}", flush=True)
+            await asyncio.sleep(5)
 
     async def setup(a):
         now=time.time();cs=(int(now)//INTERVAL)*INTERVAL
@@ -187,6 +253,9 @@ async def main():
         a["candle_ts"]=cs;a["entered"]=False;a["trade"]=None
         a["up_bid"]=a["up_ask"]=a["dn_bid"]=a["dn_ask"]=0.0
         a["candle_open"]=None
+        # v3: new candle = new market tokens, discard all book state
+        a["up_book"]={"bids":{},"asks":{}}
+        a["dn_book"]={"bids":{},"asks":{}}
         # Discard last candle's pre-signed orders — new tokens next candle
         a["signed_up"]=None;a["signed_dn"]=None
         up,dn,q,_=await get_market(a["slug"])
@@ -194,9 +263,10 @@ async def main():
             a["up_token"]=up;a["dn_token"]=dn;a["question"]=q
             print(f"[{a['label']}] {q}",flush=True)
             # Kick off pre-signing for both sides in parallel (background)
+            # Pass candle_ts so the retry loop bails out if it's rolled over
             if not DRY_RUN and clob is not None:
-                asyncio.create_task(_presign(a, up, "Up"))
-                asyncio.create_task(_presign(a, dn, "Down"))
+                asyncio.create_task(_presign(a, up, "Up",   a["candle_ts"]))
+                asyncio.create_task(_presign(a, dn, "Down", a["candle_ts"]))
 
     # ── Order submission queue + batch dispatcher ────────────────────────────
     # Pre-signed orders go here. Dispatcher drains and batches simultaneously-
@@ -323,6 +393,7 @@ async def main():
             await asyncio.sleep(3.0)
 
     def check(a):
+        nonlocal live_fires
         if a["entered"] or not a["candle_open"]: return
         now=time.time();age=now-a["candle_ts"]
         if age<10 or age>INTERVAL-30: return
@@ -333,6 +404,13 @@ async def main():
         d="Up" if move>0 else "Down"
         mid=um(a) if d=="Up" else dm(a);ask=a["up_ask"] if d=="Up" else a["dn_ask"]
         if mid<=0 or mid>0.55 or ask<=0 or ask>=0.75: return
+        # MAX_FIRES safety cap: only counted against LIVE fires, not DRY
+        if not DRY_RUN and MAX_FIRES > 0 and live_fires >= MAX_FIRES:
+            # Mark as entered so we don't keep re-evaluating same candle
+            a["entered"]=True
+            ts=datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+            print(f"  [{ts}] MAX_FIRES_REACHED [{a['label']}] {d} @{ask:.3f} — skipping (cap={MAX_FIRES})",flush=True)
+            return
         # ── entry recorded exactly like paper, plus live order path ──
         a["entered"]=True
         trade={"side":d,"ask":ask,"ts":now}
@@ -353,15 +431,20 @@ async def main():
                 # kick off re-signing in the background for the next trigger.
                 if d == "Up":
                     a["signed_up"] = None
-                    asyncio.create_task(_presign(a, a["up_token"], "Up"))
+                    asyncio.create_task(_presign(a, a["up_token"], "Up",   a["candle_ts"]))
                 else:
                     a["signed_dn"] = None
-                    asyncio.create_task(_presign(a, a["dn_token"], "Down"))
+                    asyncio.create_task(_presign(a, a["dn_token"], "Down", a["candle_ts"]))
                 order_queue.put_nowait((a, trade, signed))
                 tag = "LIVE"
             else:
+                # Loud warning: we're about to pay ~1s of signing on the hot path
+                ts_warn=datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                print(f"  [{ts_warn}] WARN_NO_PRESIGN [{a['label']}] {d} — falling back to OD (slow ~1s path). Presign was never ready for this side this candle.", flush=True)
                 asyncio.create_task(_submit_od(a, trade, token_id))
                 tag = "LIVE-OD"
+            live_fires += 1  # increment count for MAX_FIRES tracking
+            _write_fires(live_fires)  # persist so restarts can't reset
         a["trade"]=trade
         ts=datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
         print(f"  [{ts}] ENTRY[{tag}] [{a['label']}] {d} @{ask:.3f} mid={mid:.3f} mv={move:+.3f}%",flush=True)
@@ -402,9 +485,26 @@ async def main():
                             for item in data:
                                 side=ts.get(item.get("asset_id"))
                                 if not side: continue
-                                bids=item.get("bids",[]);asks=item.get("asks",[])
-                                bb=max((float(b["price"]) for b in bids),default=0) if bids else 0
-                                ba=min((float(x["price"]) for x in asks),default=0) if asks else 0
+                                # v3: maintain full book state from book + price_change events
+                                book = a["up_book"] if side=="Up" else a["dn_book"]
+                                etype = item.get("event_type","")
+                                if etype == "book":
+                                    # Full snapshot — replace entire book
+                                    book["bids"] = {b["price"]: float(b["size"]) for b in item.get("bids", [])}
+                                    book["asks"] = {x["price"]: float(x["size"]) for x in item.get("asks", [])}
+                                elif etype == "price_change":
+                                    # Incremental diffs — update specific levels
+                                    for ch in item.get("changes", []):
+                                        p  = ch["price"]
+                                        sz = float(ch["size"])
+                                        d  = book["bids"] if ch["side"]=="BUY" else book["asks"]
+                                        if sz == 0: d.pop(p, None)
+                                        else:       d[p] = sz
+                                # Recompute best bid/ask from live book state
+                                live_bids = [float(p) for p,s in book["bids"].items() if s>0]
+                                live_asks = [float(p) for p,s in book["asks"].items() if s>0]
+                                bb = max(live_bids) if live_bids else 0
+                                ba = min(live_asks) if live_asks else 0
                                 if side=="Up":
                                     if bb>0: a["up_bid"]=bb
                                     if ba>0: a["up_ask"]=ba
@@ -426,10 +526,11 @@ async def main():
             ts=datetime.now(timezone.utc).strftime("%H:%M:%S")
             wr=100*total_wins/total_trades if total_trades else 0
             tag = "LIVE" if not DRY_RUN else "DRY"
-            print(f"[{ts}] LIVE_S13[{tag}] | {total_trades}t WR={wr:.0f}% PnL=${total_pnl:+.2f}",flush=True)
+            print(f"[{ts}] LIVE_S13_V3[{tag}] | {total_trades}t WR={wr:.0f}% PnL=${total_pnl:+.2f}",flush=True)
 
     tasks=[asyncio.create_task(coinbase_ws()),asyncio.create_task(tick()),asyncio.create_task(status()),
-           asyncio.create_task(_order_dispatcher()),asyncio.create_task(_tls_keepalive())]
+           asyncio.create_task(_order_dispatcher()),asyncio.create_task(_tls_keepalive()),
+           asyncio.create_task(_presign_watchdog())]
     for a in assets.values(): tasks.append(asyncio.create_task(poly_ws(a)))
     await asyncio.gather(*tasks)
 

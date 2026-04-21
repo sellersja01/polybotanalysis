@@ -7,7 +7,9 @@
       "WebFetch(domain:gamma-api.polymarket.com)",
       "WebFetch(domain:clob.polymarket.com)",
       "WebFetch(domain:polymarket.com)",
-      "WebFetch(domain:ares.pro)"
+      "WebFetch(domain:ares.pro)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
