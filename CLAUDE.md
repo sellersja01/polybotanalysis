@@ -30,6 +30,120 @@ tail -f /root/paper_bot.log      # latency arb
 tail -f /root/collector.log      # collector
 ```
 
+## 📍 SESSION 2026-04-21 (UTC) — LIVE POST-MORTEM + SLIPPAGE DEBUG + V2 BUILT
+
+### TL;DR
+Flipped `live-s13` to real money briefly (~6 fills, ~$12 deployed, $1.47 realized loss + 4 positions open at time of stop). **Every live fill was 15–29¢ worse than what the bot's log said.** Investigated — root cause is the bot acting on a stale view of the book, then ORDER placement racing an already-moved market run by maker bots that cancel+repost faster than we fire. Built v2 copies of all three bots with a corrected WS handler. Confirmed with a diagnostic that the real problem isn't just the WS bug — **maker bots reprice the book by cancel/repost in ~10–30 ms**, so no reasonable Python latency win lets us catch the "pre-move" price. Service `live-s13` is stopped + disabled; `paper-s13-v2` running DRY alongside v1s for comparison.
+
+### What actually happened — trade-by-trade observed slippage
+
+| Trade | Asset | Side | Bot said | Real fill | Slippage |
+|---|---|---|---|---|---|
+| 1 | XRP | Down | @0.500 | $2/2.532 = **$0.79** | **29¢** |
+| 2 | XRP | Down | @0.470 | $2/3.226 = **$0.62** | 15¢ |
+| 3 | XRP | Up | @0.520 | $2/3.077 = **$0.65** | 13¢ |
+| 4 | SOL | Down | @0.400 | $2/3.030 = **$0.66** | 26¢ |
+| 5 | BTC | Down | @0.340 | $2/3.333 = **$0.60** | 26¢ |
+| 6 | ETH | Down | @0.330 | $2/3.390 = **$0.59** | 26¢ |
+
+SOL/BTC/ETH hit **exactly 26¢** of "slippage" — too consistent to be random book-walking. That's the fingerprint of the bot reading a candle-open book snapshot, then firing ~10–15s later at the real (already-repriced) market.
+
+### Root-cause investigation (what we actually proved)
+1. **Cross-checked real fills against the collector DB** — at the time of the XRP Up entry (01:14:25 UTC, bot logged @0.520), the collector had captured Up ask = **0.680** just 4s earlier. Real fill was $0.65. **DB matched reality; bot was stale.** One entry was a clean match (ETH Up @0.440 = DB 0.440), so the bug is intermittent.
+2. **Compared WS handler code**: collector maintains a full local book and processes both `book` (snapshot) and `price_change` (incremental diff) events. Bot only grabs `item["bids"]` / `item["asks"]` via `if bids else 0` and silently skips anything that isn't a full snapshot. *Hypothesis:* bot freezes at initial candle snapshot, misses incremental diffs.
+3. **30-min WS diagnostic captured 3 windows** (bug limited capture — see below). All 3 windows were at pinned end-of-candle and showed **100% `book` events, zero `price_change` events**. So Polymarket IS sending `book` events at ~30/sec — which means the bug might not be "missing price_change" alone. Could also be: blocking I/O delays, coroutine starvation, or the bot's event loop falling behind.
+4. **Conclusion:** two things are simultaneously wrong — (a) the WS handler is technically buggy (we fixed it anyway), and (b) even with a perfect WS, maker bots reprice faster than our order arrives. Fixing (a) alone won't make the strategy profitable. Fixing (b) requires either speed infrastructure OR a different strategy.
+
+### What we built this session (v2 scripts — committed)
+| File | Purpose |
+|---|---|
+| [arb_bot/paper_s13_v2.py](arb_bot/paper_s13_v2.py) | Paper s13 with fixed WS handler + log banner `S13_V2` |
+| [arb_bot/paper_s13api_v2.py](arb_bot/paper_s13api_v2.py) | Same fix for API-resolver paper |
+| [arb_bot/live_s13_v2.py](arb_bot/live_s13_v2.py) | Live trader with fix (DRY-only until validated) |
+| [arb_bot/patch_v2.py](arb_bot/patch_v2.py) | The patcher — applies 3 edits to any v1 file to produce its _v2. Documents exactly what changed. |
+| [arb_bot/paper-s13-v2.service](arb_bot/paper-s13-v2.service) | Systemd unit for paper-s13-v2 (deployed) |
+| [arb_bot/ws_diagnostic.py](arb_bot/ws_diagnostic.py) | 30-min WS event capture (had a bug — see below) |
+
+**The v2 fix** (applied to all 3 scripts by `patch_v2.py`):
+```python
+# BEFORE (v1 — only handles book events):
+bids = item.get("bids",[]); asks = item.get("asks",[])
+bb = max(... for b in bids) if bids else 0
+if bb > 0: a["up_bid"] = bb
+# price_change events have no "bids"/"asks" field, so they silently skip
+
+# AFTER (v2 — mirrors collector_v2.py):
+book = a["up_book"] if side=="Up" else a["dn_book"]
+etype = item.get("event_type", "")
+if etype == "book":
+    book["bids"] = {b["price"]: float(b["size"]) for b in item.get("bids", [])}
+    book["asks"] = {x["price"]: float(x["size"]) for x in item.get("asks", [])}
+elif etype == "price_change":
+    for ch in item.get("changes", []):
+        d = book["bids"] if ch["side"]=="BUY" else book["asks"]
+        d[ch["price"]] = float(ch["size"])
+bids_live = [float(p) for p,s in book["bids"].items() if s>0]
+asks_live = [float(p) for p,s in book["asks"].items() if s>0]
+if bids_live: a["up_bid"] = max(bids_live)
+if asks_live: a["up_ask"] = min(asks_live)
+```
+Plus asset state gets `up_book`/`dn_book` dicts and `setup()` resets them on candle rollover.
+
+### Service status when we stopped
+| Service | Status | Code | Meaning |
+|---|---|---|---|
+| `collector.service` | 🟢 active | `collector_v2.py` | **Unchanged.** Writes to all 8 `/root/market_<asset>_<tf>.db` files. Fine. |
+| `wallet-collector.service` | 🟢 active | `wallet_collector_v2.py` | Unchanged. |
+| `paper-s13.service` | 🟢 active | `paper_s13.py` (v1) | Still running — provides baseline to compare v2 against |
+| `paper-s13api.service` | 🟢 active | `paper_s13api.py` (v1) | Still running — same purpose |
+| `paper-s13-v2.service` | 🟢 active | `paper_s13_v2.py` (**new**) | **NEW** — fixed-WS paper trader, DRY. Comparison arm. |
+| `live-s13.service` | 🔴 **inactive + disabled** | `live_s13.py` (v1) | Stopped mid-session after 6 live fills |
+
+### Speed / "get there first" ideas, ranked by bang for time
+The core fight: maker bots running on Polymarket cancel their resting limit orders within ~10–30 ms of a CEX tick, then repost at the new fair price. We fire at ~200–500 ms. So by the time our order arrives, the "stale" orders we wanted to hit are gone — the only available liquidity is the new thick book at the new price. **Speed only helps if we can fire before the makers cancel.** Below 30ms = viable; 100ms = mixed; 300ms+ = losing.
+
+| # | Idea | Est. latency saved | Effort | Why (not) first |
+|---|---|---|---|---|
+| **1** | **Pre-sign order templates at candle open.** Pre-generate + EIP-712 sign a `BUY Up $X` and `BUY Down $X` at candle start (both tokens known). On signal, just HTTP POST the signed blob — skip the ~100–200ms signing step. | **100–200ms** | 1–2h | **Biggest Python-only win.** No infra change. Start here. |
+| 2 | Persistent `aiohttp` session with keep-alive to CLOB host. TLS handshake happens once, not per order. | 50–100ms | 30 min | Easy, piggyback on #1. py_clob_client may already do this — verify first. |
+| 3 | Switch CEX signal source to Binance futures (BTCUSDT-PERP, etc.) instead of Coinbase spot. Futures lead spot by 50–150ms; most HFT shops watch futures. | 50–100ms (timing, not loop) | 1h | Free edge if VPS is in Finland (Binance.com accessible). US IP would block. |
+| 4 | Colocate in AWS us-east-1 (where Polymarket's matching engine runs). Our Helsinki→US RTT is ~100ms; us-east-1 RTT to matching engine is ~1–5ms. | 80–100ms (every POST) | 1+ day | **Polymarket geoblocks US IPs.** Requires proxy / routing through EU exit = fragile and risks account flag. Postpone. |
+| 5 | Switch market orders → FOK limit at `ask + 2¢`. Not a speed fix, but a **defense:** if the book already moved past `ask + 2¢`, the order doesn't fill and we lose zero. Kills the 0.60 disasters. | 0 (defensive) | 30 min | Should combine with #1. |
+| 6 | Tighten `ask` ceiling from ≤ 0.75 → ≤ 0.55. Only enter if the book truly hasn't moved. Fewer trades, much cleaner ones. | 0 (defensive) | 1 line | **Highest-value one-line change.** Do alongside #1. |
+| 7 | Signing daemon in Go/Rust over Unix socket. ECDSA signing in Go = ~5ms (vs Python ~100ms). | 100–150ms | 1+ day | Overkill if #1 works. |
+| 8 | **Follow-mode strategy:** subscribe to Polymarket's trade/live_activity WS. When we see a burst of buys on "Up" side within 200ms of a CEX tick, those are the frontrunners confirming direction. We buy Up at 0.60 *knowing* the signal is real instead of at 0.40 *hoping* it is. | N/A (different strategy) | 1 day | **The structural escape hatch.** Accepts we can't win the race, wins EV via conviction + better WR. Likely higher real-world PnL than any pure-speed fix. |
+
+**Recommended order:** #6 (1 line, defensive) → #1 (biggest real speed) → #5 (stop-loss on latency) → #3 (free edge). Prototype #8 in parallel as a strategy fork. Skip #4 and #7 unless #1–3 don't close the gap enough.
+
+### Critical insight: how Polymarket's book actually moves
+Tested directly: when a CEX tick arrives, the book doesn't get **walked by taker trades** (option A). It gets **repriced by maker cancel+repost** (option B). Sequence:
+1. Binance / Coinbase tick arrives
+2. Maker bots see the tick on their own feed
+3. Each maker sends `cancel` for its resting bids/asks at old prices
+4. Each maker posts new limits at the new fair price
+5. Old orders are **gone** (canceled, not filled); new thick book sits at the new price
+
+Implication: there's no ladder of orders at intermediate prices (0.42, 0.45, 0.48…) for us to walk through. Our market order arrives and finds a cleaned-out book with fresh orders only at 0.60. **Faster ≠ more cheap fills — it's binary: either we beat the cancel (<30ms) or we don't.** This is why pure speed optimization has steep diminishing returns past the first ~100ms.
+
+### Data gaps + bugs we noted (not fixing tonight)
+- **Collector WS silence:** saw 16 seconds of zero BTC `polymarket_odds` rows around 23:10:35-23:10:51 UTC, exactly during candle rollover. Suggests collector's Poly WS briefly drops during token-id transition. Worth a watchdog.
+- **ws_diagnostic.py has a bug:** poly_ws doesn't reconnect when tokens change at candle rollover, so after the first candle it stayed subscribed to dead tokens. Only captured 3 windows in 30 min (all from first candle, all pinned end-of-candle — no mid-candle reprice captured). If we rerun for better data, fix: break out of `async with` block when `candle_ts` changes and reconnect with new tokens.
+- **Live fills open at session-stop time:** XRP Up ~3.08sh @$0.65, SOL Down ~3.03sh @$0.66, BTC Down ~3.33sh @$0.60, ETH Down ~3.39sh @$0.59. Combined cost ~$8; each will resolve on its own at candle end.
+
+### Suggested next-session plan
+1. **Pull 12–24h of `/root/paper_s13_v2.log` data**, compare entries and PnL vs original `paper-s13.service`. If v2 is materially better, the WS fix has real value even without a speed win.
+2. **Implement #6 first (1-line: lower `ask` ceiling to 0.55)** in a new `paper_s13_v3.py`. This alone may make the strategy profitable at our current speed because we simply don't take the trades where front-runners already moved the book.
+3. **Implement #1 (pre-signed orders)** if #6 looks good but still too slow.
+4. **Decide between pure-speed path (#1+#3+#5) vs strategy pivot (#8)** based on v2 vs v1 comparison data.
+5. **Do NOT go live again** until paper_v3 or v4 shows consistent WR > 65% with real entry prices ≈ what the log claims (audit each trade with the cross-check script).
+
+### Files to look at next time
+- `/root/paper_s13_v2.log` on VPS — running data
+- `arb_bot/patch_v2.py` — if we need to generate _v3 from _v2 with one more tweak
+- `arb_bot/ws_diagnostic.py` — fix the rollover bug if we want real mid-candle data
+
+---
+
 ## 📍 SESSION 2026-04-20 — S13 VALIDATED + LIVE BOT READY (GO-LIVE NEXT)
 
 ### What we built this session

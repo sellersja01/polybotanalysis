@@ -1,0 +1,16 @@
+[Unit]
+Description=Paper Trader s13 v2 (fixed WS book-handling)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 -u /root/paper_s13_v2.py
+StandardOutput=append:/root/paper_s13_v2.log
+StandardError=append:/root/paper_s13_v2.log
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
