@@ -6,14 +6,14 @@ import sqlite3, time, os
 from datetime import datetime, timezone
 from collections import defaultdict
 
-INTERVAL     = 300
-MOVE_THRESH  = 0.03
-SLIPPAGE     = 0.06
-TRADE_USD    = 2.0
-MIN_AGE      = 10
-MAX_AGE      = INTERVAL - 30
-MAX_MID      = 0.55
-MAX_ASK      = 0.75
+INTERVAL          = 300
+MOVE_THRESH       = 0.03
+SLIPPAGE          = 0.06
+SHARES_PER_TRADE  = 100   # fixed size model: always buy 100 shares (cost varies with price)
+MIN_AGE           = 10
+MAX_AGE           = INTERVAL - 30
+MAX_MID           = 0.55
+MAX_ASK           = 0.75
 ASSETS = ['btc','eth','sol','xrp']
 
 def backtest_asset(asset):
@@ -107,12 +107,12 @@ def backtest_asset(asset):
             if ask <= 0 or ask >= MAX_ASK: continue
             effective_fill = ask + SLIPPAGE
             if effective_fill >= 1.0: continue
-            shares = TRADE_USD / effective_fill
-            pnl = (shares * 1.0 - TRADE_USD) if direction == winner else (0.0 - TRADE_USD)
+            cost = SHARES_PER_TRADE * effective_fill
+            pnl = (SHARES_PER_TRADE * 1.0 - cost) if direction == winner else (0.0 - cost)
             trades.append({
                 'candle_ts': cs, 'asset': asset.upper(),
                 'direction': direction, 'log_ask': ask,
-                'effective_fill': effective_fill, 'shares': shares,
+                'effective_fill': effective_fill, 'shares': SHARES_PER_TRADE, 'cost': cost,
                 'winner': winner, 'pnl': pnl, 'age': age, 'move_pct': move_pct,
             })
             break  # one entry per candle
@@ -125,7 +125,7 @@ def backtest_asset(asset):
 
 def summarize(results):
     print(f'\n{"="*72}')
-    print(f'  Backtest: live_s13_v3 logic — {MOVE_THRESH}% CEX move, ${TRADE_USD}/trade, {int(SLIPPAGE*100)}c slippage')
+    print(f'  Backtest: live_s13_v3 logic — {MOVE_THRESH}% CEX move, {SHARES_PER_TRADE} shares/trade, {int(SLIPPAGE*100)}c slippage')
     print(f'{"="*72}\n')
     all_trades = []
     for r in results: all_trades.extend(r['trades'])
@@ -160,9 +160,11 @@ def summarize(results):
     avg_tr = total_pnl / len(all_trades)
     daily = total_pnl / days if days > 0 else 0
     print(f'\n{"TOTAL":<6} {"":>8} {"":>10} {len(all_trades):>7} {len(wins):>6} {wr:>5.1f}% {aw:>9.2f} {al:>9.2f} {avg_tr:>10.2f} {total_pnl:>10.2f}')
-    print(f'\nExtrapolated PnL at ${TRADE_USD}/trade: ${daily:.2f}/day')
-    print(f'  scaled to $20/trade:  ${daily*10:.2f}/day')
-    print(f'  scaled to $100/trade: ${daily*50:.2f}/day')
+    total_deployed = sum(t['cost'] for t in all_trades)
+    print(f'\nDaily PnL at {SHARES_PER_TRADE} shares/trade: ${daily:.2f}/day')
+    print(f'Total capital deployed across {len(all_trades)} trades: ${total_deployed:,.2f}')
+    print(f'Avg capital per trade: ${total_deployed/len(all_trades):.2f}')
+    print(f'Return on deployed capital: {total_pnl/total_deployed*100:.2f}%')
 
     print(f'\n--- By entry-price band (effective fill incl. {int(SLIPPAGE*100)}c slippage) ---')
     bands = [(0, 0.10), (0.10, 0.25), (0.25, 0.45), (0.45, 0.55), (0.55, 0.70), (0.70, 0.82)]
